@@ -99,6 +99,8 @@
         .tag.active { background: #3182ce; color: white; border-color: #3182ce; font-weight: bold; }
         .sort-select { padding: 5px; border-radius: 6px; border: 1px solid #cbd5e0; font-size: 0.85rem; flex-grow: 1; color: #2d3748;}
         
+        /* [S05] 生成日時の表示。常時見えるが読書の邪魔にならないよう小さく淡くする。 */
+        .build-stamp { margin-top: 8px; font-size: 0.7rem; color: #a0aec0; text-align: right; font-variant-numeric: tabular-nums; }
         .action-buttons { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 5px; padding-top: 10px; border-top: 1px dashed #e2e8f0; }
         .btn-action { padding: 6px 12px; font-size: 0.8rem; border-radius: 6px; border: 1px solid #cbd5e0; background: #f7fafc; color: #4a5568; cursor: pointer; font-weight: bold;}
         .btn-action:active { background: #edf2f7; }
@@ -253,6 +255,12 @@
             <button class="btn-action" id="btnToggleAllPoints">📝 全ポイント開く</button>
             <button class="btn-action btn-toggle on" id="btnToggleVoice">🎙️ 高音質</button>
         </div>
+        <!-- [S05] 生成日時。iPhoneのホーム画面から起動した場合、Safari本体とは
+             別のキャッシュで動くため、公開が成功していても古い版が表示され続ける
+             ことがある。キャッシュ自体は制御せず（1MB超を毎回再取得させないため）、
+             「今見ているのがいつ生成された版か」を必ず見える位置に出すことで、
+             古いまま気づかない状態をなくす。 -->
+        <div class="build-stamp">生成: 2026-08-13 14:15</div>
     </div>
 
     <div class="file-list" id="fileListContainer"></div>
