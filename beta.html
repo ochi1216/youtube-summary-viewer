@@ -1905,16 +1905,16 @@
     ".ym .frow:last-child{border-bottom:0}.ym .frow input{width:22px;height:22px}.ym .frow .h{flex:1}.ym .frow .n{color:#718096;font-size:.85rem}",
     ".ym .meta{display:flex;justify-content:space-between;align-items:center;gap:8px;font-size:.9rem;color:#4a5568;margin:2px 0 6px}",
     ".ym .bar{height:6px;background:#e2e8f0;border-radius:3px;margin:0 0 8px;overflow:hidden}.ym .bar i{display:block;height:100%;background:#3b6ab0}",
-    ".ym .card{background:#fff;border:2px solid #e2e8f0;border-radius:14px;padding:12px;margin:8px 0}",
+    ".ym .card{background:#fff;border:2px solid #e2e8f0;border-radius:14px;padding:12px;margin:8px 0;display:flex;flex-direction:column;overflow:hidden;box-sizing:border-box;height:calc(max(20vh,110px) + 236px)}",
     ".ym .card.star{background:#fffbeb;border-color:#d4a017}",
     ".ym .thumb{display:block;width:100%;height:20vh;min-height:110px;object-fit:contain;border-radius:10px;background:#000;margin-bottom:8px}",
     ".ym .badges{display:flex;gap:8px;align-items:center;margin:0 0 4px;flex-wrap:wrap}",
     ".ym .score{font-size:.8rem;font-weight:bold;color:#fff;background:#3b6ab0;border-radius:6px;padding:2px 8px}",
     ".ym .score.s1,.ym .score.s2{background:#a0aec0}.ym .score.s5{background:#d4a017}",
     ".ym .chan{font-size:.85rem;color:#3b6ab0;font-weight:bold}",
-    ".ym .card h2{font-size:1.1rem;margin:2px 0 8px;line-height:1.4;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}",
+    ".ym .card h2{font-size:1.1rem;margin:2px 0 8px;line-height:1.4;min-height:2.8em;flex:none;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}",
     ".ym .plab{font-size:.8rem;color:#718096;margin-bottom:4px}",
-    ".ym .ptext{font-size:1rem;line-height:1.6;background:#fef9c3;border-radius:8px;box-sizing:border-box;padding:8px 8px 0;height:calc(4.8rem + 8px);overflow-y:auto;-webkit-overflow-scrolling:touch}",
+    ".ym .ptext{font-size:1rem;line-height:1.6;background:#fef9c3;border-radius:8px;box-sizing:border-box;padding:8px 8px 0;height:calc(4.8rem + 8px);flex:none;overflow-y:auto;-webkit-overflow-scrolling:touch}",
     ".ym .lbl-sc{display:flex;gap:6px;margin:12px 0}",
     ".ym .lbl-sc button{flex:1;min-height:64px;border-radius:12px;border:2px solid #2c5282;background:#fff;color:#1a365d;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:2px;font-size:.75rem}.ym .lbl-sc button b{font-size:1.3rem}",
     ".ym .lbl-t{font-weight:bold;font-size:1.05rem;line-height:1.5;margin:6px 0}.ym .lbl-m{font-size:.85rem;color:#4a5568;margin-bottom:6px}",
@@ -2605,6 +2605,15 @@
     ensureOverlays(ctx);
   }
 
+  // 画像が無いカードは、カード全体の高さを変えずに、画像の高さぶんを文の欄にまわす。行の途中で切れないよう、欄の高さは行の整数倍にそろえる。
+  function fitText(ui) {
+    var t = ui.ptext, hasThumb = ui.thumb.style.display !== "none";
+    if (hasThumb) { t.style.flex = ""; t.style.height = ""; return; }
+    t.style.flex = "1 1 auto"; t.style.height = "";
+    var h = t.clientHeight, lh = parseFloat(W.getComputedStyle(t).lineHeight) || 25.6, n = Math.floor((h - 8) / lh);
+    if (n >= 3) { t.style.flex = "none"; t.style.height = (n * lh + 8) + "px"; }
+  }
+
   function updateListen(ctx, st) {
     var ui = ctx.ui, e = st.entry, it, key, per, i;
     if (!ui || !e) return;
@@ -2625,6 +2634,7 @@
     ui.plab.textContent = (fh ? fh + "・" : "") + (st.part ? ("いま読んでいる部分: " + pn[st.part.part]) : "");
     var shown = st.part ? st.part.text.replace(/^\d+番。\s*/, "") : "";
     if (ui.ptext.textContent !== shown) { ui.ptext.textContent = shown; ui.ptext.scrollTop = 0; }
+    fitText(ui);
     ui.play.textContent = st.playing ? "⏸ 停止" : "▶ 再生";
 
     // 深さの列: 各深さの約N分(このカード)、いま効いている深さを青く。
