@@ -1942,6 +1942,7 @@
     ".ym .sheet h3{margin:12px 0 4px;font-size:.95rem;color:#3b6ab0}",
     ".ym .sheet .sec{white-space:pre-wrap;line-height:1.7;font-size:1rem;border-radius:8px;padding:6px 8px;margin:2px 0}",
     ".ym .sheet .sec.hl{background:#fef9c3}",
+    ".ym .sheet .ph{color:#2b6cb0;font-weight:700;margin-top:10px}.ym .sheet .ph:first-child{margin-top:0}.ym .sheet .pli{margin:2px 0 4px;color:#4a5568}",
     ".ym .sheet .close{position:sticky;top:0;display:block;margin:0 0 8px auto;z-index:2;font-size:1rem;padding:8px 14px;border-radius:10px;border:1px solid #cbd5e0;background:#fff}",
     ".ym .sheet .foot{display:flex;gap:8px;margin:16px 0 4px}.ym .sheet .foot>*{flex:1;text-align:center;padding:14px 4px;border-radius:10px;border:1px solid #cbd5e0;background:#fff;color:#2d3748;text-decoration:none;font-size:1rem}",
     ".ym .opt{display:block;width:100%;text-align:left;padding:12px;margin:8px 0;border-radius:10px;border:2px solid #e2e8f0;background:#fff;font-size:1rem}",
@@ -1976,6 +1977,24 @@
     var i, d = ctx.data.ALL_DATA;
     for (i = 0; i < d.length; i++) if (d[i].filename === filename) return W.YMBeta.fileHeading(d[i]);
     return "";
+  }
+
+  // 主なポイント: 旧UIと同じく、小見出し(青の太字)と箇条書きに分けて出す。見出しが見つからなければ、ただの文にする。
+  function pointsBlocks(ctx, html, host) {
+    var doc = ctx.doc, n = 0;
+    try {
+      var dom = new W.DOMParser().parseFromString(String(html || ""), "text/html"), kids = dom.body.children, i;
+      for (i = 0; i < kids.length; i++) {
+        var k = kids[i], tag = k.tagName.toLowerCase();
+        var isHead = (tag === "p" && /fw-bold/.test(k.className)) || /^h[1-6]$/.test(tag) || /2b6cb0/i.test(k.getAttribute("style") || "");
+        if (isHead && tag !== "ul") { host.appendChild(el(doc, "div", "ph", k.textContent.replace(/^\s+|\s+$/g, ""))); n++; }
+        else if (tag === "ul" || tag === "ol") {
+          var lis = k.querySelectorAll("li"), j;
+          for (j = 0; j < lis.length; j++) host.appendChild(el(doc, "div", "pli", "・" + lis[j].textContent.replace(/^\s+|\s+$/g, "")));
+        } else if (k.textContent.replace(/\s/g, "")) host.appendChild(el(doc, "div", "pli", plainBlocks(k.innerHTML)));
+      }
+    } catch (e) { n = 0; }
+    if (!n) { host.innerHTML = ""; host.textContent = plainBlocks(html); }
   }
 
   function plainBlocks(html) {
@@ -2307,9 +2326,8 @@
       cb.appendChild(el(doc, "div", "eyebrow", "🧭 本日の方角"));
       cb.appendChild(el(doc, "div", "t", W.YMListen.stripHtml(comp.needle_text)));
       if (comp.sub_text) cb.appendChild(el(doc, "div", "dnote", W.YMListen.stripHtml(comp.sub_text)));
-      var cText = W.YMListen.stripHtml(comp.needle_text) + (comp.sub_text ? "\n" + W.YMListen.stripHtml(comp.sub_text) : "");
       var cBtn = el(doc, "button", "btn", ctx.compassOn ? "⏹ 止める" : "🔊 聴く"); cBtn.id = "ymCompassBtn";
-      cBtn.addEventListener("click", function () { toggleCompass(ctx, cText, cBtn); });
+      cBtn.addEventListener("click", function () { toggleCompass(ctx, compassText(ctx), cBtn); });
       cb.appendChild(cBtn);
       root.appendChild(cb);
     }
@@ -2444,7 +2462,8 @@
     for (i = 0; i < secs.length; i++) {
       if (!secs[i][1]) continue;
       sh.appendChild(el(doc, "h3", "", secs[i][0]));
-      var d = el(doc, "div", "sec", plainBlocks(secs[i][1])); d.setAttribute("data-part", secs[i][2]);
+      var d = el(doc, "div", "sec", secs[i][2] === "points" ? "" : plainBlocks(secs[i][1])); d.setAttribute("data-part", secs[i][2]);
+      if (secs[i][2] === "points") pointsBlocks(ctx, secs[i][1], d);
       sh.appendChild(d);
     }
     var foot = el(doc, "div", "foot");
@@ -2924,6 +2943,35 @@
     clearMediaSession();
     bgStopSoon(function () { return false; });
     renderHome(ctx);
+  }
+
+  // 本日の方角の読み上げ文: 針の1行 + 「今日読むもの」のうち「仕事に効く」「プライベート」の中身(見出し・要旨・事実・理由・行動)。
+  function compassText(ctx) {
+    var d = ctx.data.DASHBOARD_DATA, comp = d && d.compass, out = [];
+    function plain(t) { return W.YMListen.stripHtml(String(t || "")).replace(/^\s+|\s+$/g, ""); }
+    function end(t) { t = plain(t); return t && !/[。!?！？]$/.test(t) ? t + "。" : t; }
+    if (comp && comp.needle_text) out.push(end(comp.needle_text));
+    try {
+      if (d && d.es_html && W.DOMParser) {
+        var dom = new W.DOMParser().parseFromString(d.es_html, "text/html"), box = dom.querySelector(".es"), kids = box ? box.children : [], i, on = false;
+        for (i = 0; i < kids.length; i++) {
+          var k = kids[i], cls = " " + k.className + " ";
+          if (cls.indexOf(" es-group ") >= 0) {
+            var g = plain(k.textContent);
+            on = (g === "仕事に効く" || g === "プライベート");
+            if (on) out.push(end(g));
+          } else if (cls.indexOf(" es-item ") >= 0 && on) {
+            var h = k.querySelector(".es-head b"), sm = k.querySelector(".es-sum"), fs = k.querySelectorAll(".es-facts li"), why = k.querySelector(".es-why"), act = k.querySelector(".es-act"), j;
+            if (h) out.push(end(h.textContent));
+            if (sm) out.push(end(sm.textContent));
+            for (j = 0; j < fs.length; j++) out.push(end(fs[j].textContent));
+            if (why) out.push(end(why.textContent));
+            if (act) out.push(end(act.textContent));
+          } else on = false;
+        }
+      }
+    } catch (e) { }
+    return out.join("\n");
   }
 
   // 本日の方角を読み上げる(ボタンで始め・止め)。聴く画面に入る前に必ず止める。
