@@ -1238,6 +1238,22 @@
     return "約" + m + "分";
   }
 
+  // 1枚ぶんの長さの言い方。1分未満は「約N秒」(5秒刻み)、それ以上は「約N分」。
+  function durLabel(sec) {
+    if (sec < 60) return "約" + Math.max(5, Math.round(sec / 5) * 5) + "秒";
+    return "約" + Math.ceil(sec / 60) + "分";
+  }
+
+  // そのカードを、各深さで聴いたときの長さ。[{key, name, depth, sec, label}]
+  function perDepth(item, rate) {
+    var out = [], i;
+    for (i = 0; i < DEPTHS.length; i++) {
+      var s = estimateSec(item, DEPTHS[i].depth, rate);
+      out.push({ key: DEPTHS[i].key, name: DEPTHS[i].name, depth: DEPTHS[i].depth, sec: s, label: durLabel(s) });
+    }
+    return out;
+  }
+
   // 深さ自動。ListenDepth.decide と同じ材料を、カードとサマリーから集める。
   // 戻り値 {depth, key, name, why}。ListenDepth が無い・失敗したときは要旨。
   function autoDepth(listenDepth, item, category) {
@@ -1331,7 +1347,7 @@
   return {
     DEPTHS: DEPTHS, LIMIT_SEC: LIMIT_SEC, CHARS_PER_SEC: CHARS_PER_SEC,
     byDepth: byDepth, byKey: byKey, stripHtml: stripHtml, parts: parts, estimateSec: estimateSec,
-    minutesLabel: minutesLabel, autoDepth: autoDepth, sortCards: sortCards, plan: plan, fileStamp: fileStamp
+    minutesLabel: minutesLabel, durLabel: durLabel, perDepth: perDepth, autoDepth: autoDepth, sortCards: sortCards, plan: plan, fileStamp: fileStamp
   };
 });
 </script>
@@ -1378,14 +1394,23 @@
     var listen = o.listen;
     var setT = o.setTimer || function (f, ms) { return setTimeout(f, ms); };
     var clearT = o.clearTimer || function (t) { clearTimeout(t); };
-    var st = { i: 0, p: 0, playing: false, depthKey: null, rate: (typeof o.rate === "number" && o.rate > 0) ? o.rate : 1, finished: false };
-    var gen = 0, timer = null, cur = null;
+    var st = { i: 0, p: 0, playing: false, depthKey: null, pinKey: null, rate: (typeof o.rate === "number" && o.rate > 0) ? o.rate : 1, finished: false };
+    var gen = 0, timer = null, cur = null, dead = false;
 
     function entry() { return items[st.i] || null; }
 
+    // 深さ: このカードだけ手で選んだ > 📌ずっと > 自動。カードが変わると「このカードだけ」は自動(または📌)に戻る。
     function depthOf(e) {
-      if (st.depthKey) { var d = listen.byKey(st.depthKey); if (d) return d; }
-      return listen.byDepth(e.depth);
+      var d = null;
+      if (st.depthKey) d = listen.byKey(st.depthKey);
+      if (!d && st.pinKey) d = listen.byKey(st.pinKey);
+      return d || listen.byDepth(e.depth);
+    }
+
+    function remainingSec() {
+      var sum = 0, k;
+      for (k = st.i; k < items.length; k++) sum += listen.estimateSec(items[k].card.item, depthOf(items[k]).depth, st.rate);
+      return sum;
     }
 
     function partsFor(e) {
@@ -1396,7 +1421,7 @@
       var e = entry();
       return {
         i: st.i, p: st.p, total: items.length, playing: st.playing, finished: st.finished,
-        rate: st.rate, depthKey: st.depthKey, entry: e,
+        rate: st.rate, depthKey: st.depthKey, pinKey: st.pinKey, remainingSec: remainingSec(), entry: e,
         depthName: e ? depthOf(e).name : "", auto: !st.depthKey,
         part: e ? (partsFor(e)[st.p] || null) : null
       };
@@ -1422,7 +1447,7 @@
     function leaveCard(how) {
       var e = entry();
       if (e && o.onCardEnd) { try { o.onCardEnd(e, how); } catch (err) { } }
-      st.i++; st.p = 0;
+      st.i++; st.p = 0; st.depthKey = null;
       if (st.i >= items.length) { st.i = items.length; finishAll(); return false; }
       return true;
     }
@@ -1449,11 +1474,26 @@
         emit();
         schedule();
       }
+      // 読み上げのエラーは「読み終えた」ではない。止めて知らせる(カードを進めず、既読にもしない)。
+      // 止めたときの cancel で出る interrupted / canceled は、エラーではないので無視する。
+      function fail(reason) {
+        if (handled || myGen !== gen || !st.playing) return;
+        handled = true;
+        st.playing = false;
+        killCurrent();
+        if (o.bg) o.bg.stopSoon();
+        emit();
+        if (o.onError) { try { o.onError(reason); } catch (err2) { } }
+      }
       ut.onend = done;
-      ut.onerror = done;
+      ut.onerror = function (ev) {
+        var er = ev && ev.error ? String(ev.error) : "";
+        if (er === "interrupted" || er === "canceled") return;
+        fail(er || "error");
+      };
       cur = ut;
       emit();
-      try { o.synth.speak(ut); } catch (err) { done(); }
+      try { o.synth.speak(ut); } catch (err) { fail("speak"); }
     }
 
     function schedule() {
@@ -1464,7 +1504,7 @@
     var api = {
       state: state,
       play: function () {
-        if (st.finished || !items.length) return;
+        if (dead || st.finished || !items.length) return;
         st.playing = true;
         if (o.bg) o.bg.start();
         killCurrent();
@@ -1472,7 +1512,7 @@
         schedule();
       },
       pause: function () {
-        if (!st.playing) return;
+        if (dead || !st.playing) return;
         st.playing = false;
         killCurrent();
         if (o.bg) o.bg.stopSoon();
@@ -1480,7 +1520,7 @@
       },
       // 次のカードへ。読んでいた分は「飛ばした」として知らせる。
       next: function () {
-        if (st.finished || !entry()) return;
+        if (dead || st.finished || !entry()) return;
         killCurrent();
         var more = leaveCard("skip");
         if (!more) return;
@@ -1489,17 +1529,19 @@
       },
       // 今のカードの頭へ。すでに頭なら前のカードへ。既読は取り消さない。
       prev: function () {
-        if (st.finished) return;
+        if (dead || st.finished) return;
         killCurrent();
         if (st.p > 0) st.p = 0;
-        else if (st.i > 0) { st.i--; st.p = 0; }
+        else if (st.i > 0) { st.i--; st.p = 0; st.depthKey = null; }
         emit();
         if (st.playing) schedule();
       },
-      // 深さを手で決める。null で自動に戻す。話している部分は止めず、次の部分から効く。
+      // 深さを、このカードだけ手で決める。null で自動(または📌)に戻す。話している部分は止めず、次の部分から効く。
       setDepth: function (key) { st.depthKey = key || null; emit(); },
+      // 📌 ずっとこの深さにする。null で外す。
+      setPin: function (key) { st.pinKey = key || null; emit(); },
       setRate: function (r) { if (typeof r === "number" && r > 0) { st.rate = r; emit(); } },
-      destroy: function () { st.playing = false; killCurrent(); }
+      destroy: function () { dead = true; st.playing = false; killCurrent(); }
     };
     return api;
   }
@@ -1532,7 +1574,8 @@
   // Python側 summary_analysis.video_id_of と同じ: URLの ?v= の値。無ければURLそのもの。
   function videoIdOf(url) {
     var m = /[?&]v=([^&#]*)/.exec(url || "");
-    return m ? decodeURIComponent(m[1]) : "";
+    if (!m) return "";
+    try { return decodeURIComponent(m[1]); } catch (e) { return m[1]; }
   }
 
   // カードの身元キー。urlがあれば 動画id か URL、無ければ位置で代用(p:ファイル名_位置)。
@@ -1645,6 +1688,83 @@
     return JSON.stringify(o);
   }
 
+  // 旧UIの既読から、指定のカードだけ外す(「昨日以前を既読」の取り消し用)。読めない・壊れているときは null。
+  function removeOldRead(stateText, pairs) {
+    var o;
+    try { o = JSON.parse(stateText); } catch (e) { return null; }
+    if (!isObj(o) || !isObj(o.readHistory)) return null;
+    for (var i = 0; i < pairs.length; i++) delete o.readHistory[pairs[i][0] + "_" + pairs[i][1]];
+    return JSON.stringify(o);
+  }
+
+  // まとめて既読にする。cards: [{key, filename, iIdx}]。戻り値 {read, keys(新しく既読にしたキー), pairs(旧UIへ書く [ファイル名, 位置])}
+  function bulkMark(readV2, cards, now) {
+    var out = {}, k, keys = [], pairs = [], i;
+    for (k in (readV2 || {})) if (Object.prototype.hasOwnProperty.call(readV2, k)) out[k] = readV2[k];
+    for (i = 0; i < cards.length; i++) {
+      pairs.push([cards[i].filename, cards[i].iIdx]);
+      if (!out[cards[i].key]) { out[cards[i].key] = now || 1; keys.push(cards[i].key); }
+    }
+    return { read: out, keys: keys, pairs: pairs };
+  }
+
+  // 取り消し。bulkMark が新しく既読にしたキーだけを外す(元から既読だったものは残す)。
+  function unmark(readV2, keys) {
+    var out = {}, k, drop = {}, i;
+    for (i = 0; i < keys.length; i++) drop[keys[i]] = true;
+    for (k in (readV2 || {})) if (Object.prototype.hasOwnProperty.call(readV2, k) && !drop[k]) out[k] = readV2[k];
+    return out;
+  }
+
+  // 生成時刻。index.html の本文の「生成: YYYY-MM-DD HH:MM」から。無ければ null。戻り値は ms(端末の時刻として解釈)。
+  function parseBuildTime(html) {
+    var m = /生成: (\d{4})-(\d\d)-(\d\d) (\d\d):(\d\d)/.exec(html || "");
+    if (!m) return null;
+    return new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]), Number(m[4]), Number(m[5])).getTime();
+  }
+
+  function agoLabel(ms) {
+    var min = Math.max(0, Math.floor(ms / 60000));
+    if (min < 1) return "いま";
+    if (min < 60) return min + "分前";
+    if (min < 60 * 24) return Math.floor(min / 60) + "時間前";
+    return Math.floor(min / 1440) + "日前";
+  }
+
+  // 次の定時更新(HH:MM の一覧のうち、いまより後で最も近いもの。無ければ翌日の最初)。
+  function nextChain(nowMs, times) {
+    var now = new Date(nowMs), best = null, i;
+    for (i = 0; i < times.length; i++) {
+      var p = times[i].split(":");
+      var t = new Date(now.getFullYear(), now.getMonth(), now.getDate(), Number(p[0]), Number(p[1])).getTime();
+      if (t <= nowMs) t += 86400000;
+      if (best === null || t < best) best = t;
+    }
+    return best;
+  }
+
+  function two(n) { return (n < 10 ? "0" : "") + n; }
+  function hhmm(ms) { var d = new Date(ms); return two(d.getHours()) + ":" + two(d.getMinutes()); }
+
+  // サマリーの人の言葉の見出し: 「RSS 10/29 朝」。ファイル名の _YYYYMMDD_HHMMSS から。
+  function fileHeading(file) {
+    var m = /_(\d{4})(\d\d)(\d\d)_(\d\d)/.exec((file && file.filename) || "");
+    var cat = (file && file.category) ? String(file.category) : "";
+    if (!m) return cat || (file && file.filename) || "";
+    var h = Number(m[4]);
+    var zone = h < 9 ? "朝" : (h < 16 ? "昼" : "夜");
+    return (cat ? cat + " " : "") + Number(m[2]) + "/" + Number(m[3]) + " " + zone;
+  }
+
+  // 「今日」の0時(端末の時刻)。「昨日以前」の境目。
+  function startOfDay(nowMs) { var d = new Date(nowMs); return new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime(); }
+
+  // サマリーの日付(ファイル名の _YYYYMMDD から)。無ければ null。
+  function fileDayStart(file) {
+    var m = /_(\d{4})(\d\d)(\d\d)_/.exec((file && file.filename) || "");
+    return m ? new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3])).getTime() : null;
+  }
+
   // ---- ブラウザ側の起動(node のテストでは動かない) ----
   function lsGet(key) { try { return localStorage.getItem(key); } catch (e) { return null; } }
   function lsSet(key, val) { try { localStorage.setItem(key, val); return true; } catch (e) { return false; } }
@@ -1652,7 +1772,10 @@
   function loadReadV2() {
     var s = lsGet(READ_V2_KEY), o = null;
     try { o = s ? JSON.parse(s) : null; } catch (e) { o = null; }
-    return (o && o.v === 2 && isObj(o.read)) ? o.read : {};
+    if (o && o.v === 2 && isObj(o.read)) return o.read;
+    // 保存があるのに読めない: 上書きする前に、別の名前へ退避する(失わない)。退避が済んでいれば重ねない。
+    if (s && !lsGet(READ_V2_KEY + "Broken")) lsSet(READ_V2_KEY + "Broken", s);
+    return {};
   }
   function saveReadV2(read) { return lsSet(READ_V2_KEY, JSON.stringify({ v: 2, read: read })); }
 
@@ -1717,6 +1840,16 @@
     importRead: importRead,
     extractData: extractData,
     addOldRead: addOldRead,
+    removeOldRead: removeOldRead,
+    bulkMark: bulkMark,
+    unmark: unmark,
+    parseBuildTime: parseBuildTime,
+    agoLabel: agoLabel,
+    nextChain: nextChain,
+    hhmm: hhmm,
+    fileHeading: fileHeading,
+    startOfDay: startOfDay,
+    fileDayStart: fileDayStart,
     OLD_STATE_KEY: OLD_STATE_KEY,
     loadReadV2: loadReadV2,
     saveReadV2: saveReadV2,
@@ -1729,10 +1862,10 @@
 <script>/*
  * beta_app.js - 新UI(beta.html)の画面。ブラウザでだけ動く(node のテスト対象外。部品は beta_ui / beta_listen / beta_player 側でテスト済み)。
  *
- * ホーム → 「▶ 聴く」 → 聴く画面 → 15分で区切って「続けて聴く」。
+ * ホーム → 「▶ 聴く」 → 聴く画面 → 15分で区切って「続けて聴く」。モックアップ v4(docs/mockups/mock_v4.html)の決定に沿う。
  *   - 既読は beta の保存(summaryManagerReadV2)に書き、同時に旧UIの既読(summaryManagerState.readHistory)にも追加する。
  *     読み終えたカードも「次」で飛ばしたカードも既読にする(利用者の決定)。戻る・止めるでは既読にしない。
- *   - 👎👍は旧UIと同じ部品(labels.js)で、同じ保存先・同じ合言葉(ytLabelKey)に送る。
+ *   - 👎👍・読み方の登録は旧UIと同じ部品(labels.js・tts_user_dict.js)で、同じ保存先・同じ合言葉(ytLabelKey)に送る。
  *   - 背景再生は旧UIと同じ方式(聞こえない無音を繰り返し再生し、Media Session で操作を受ける)。
  *
  * 古いiOS Safariで構文エラーになる記法(アロー関数・let/const・?.・??・replaceAll・後読み)は使わない。
@@ -1743,27 +1876,51 @@
   "use strict";
 
   var RATES = [1.0, 1.2, 1.3, 1.4, 1.5, 1.6, 1.7, 1.8, 1.9, 2.0, 3.0];
-  var ORDERS = [["score", "点数の高い順"], ["newest", "新しい順"], ["oldest", "古い順"]];
+  var ORDERS = [
+    ["score", "点数の高い順", "サマリーをまたいで、★付きを先頭に、AIの点が高いものから。"],
+    ["newest", "サマリーごと・新しい順", "新しいサマリーから、サマリーの中は並んでいる順(今の「更新日時(新しい順)」と同じ)。"],
+    ["oldest", "サマリーごと・古い順", "古いサマリーから、サマリーの中は並んでいる順。"]
+  ];
+  // 定時の更新(ホームの「次は…」の表示用)。時刻を変えたらここも変える。
+  var CHAIN_TIMES = ["05:00", "11:30", "20:00"];
   var IS_IOS = /iP(hone|ad|od)/.test((W.navigator && W.navigator.userAgent) || "");
 
   var CSS = [
     "body{margin:0;font-family:-apple-system,'Hiragino Sans',sans-serif;background:#f7fafc;color:#1a202c;-webkit-text-size-adjust:100%}",
-    ".ym{padding:16px;padding-bottom:calc(16px + env(safe-area-inset-bottom));max-width:640px;margin:0 auto}",
-    ".ym h1{font-size:1.1rem;margin:0 0 12px}",
+    ".ym{padding:16px;padding-bottom:calc(24px + env(safe-area-inset-bottom));max-width:640px;margin:0 auto}",
+    ".ym h1{font-size:1.1rem;margin:0 0 8px}",
     ".ym pre{white-space:pre-wrap;font-size:.9rem;margin:0 0 12px;font-family:inherit}",
     ".ym select{font-size:1rem;padding:8px;border-radius:8px;border:1px solid #cbd5e0;background:#fff}",
     ".ym .row{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin:8px 0}",
-    ".ym .big{display:block;width:100%;min-height:72px;font-size:1.2rem;font-weight:bold;border:0;border-radius:14px;background:#3b6ab0;color:#fff;margin:16px 0}",
+    ".ym .eyebrow{font-size:.8rem;color:#718096;margin-bottom:4px}",
+    ".ym .compass{background:#fff;border:1px solid #e2e8f0;border-radius:12px;padding:12px;margin:8px 0}",
+    ".ym .compass .t{font-size:1.05rem;font-weight:bold;line-height:1.5}",
+    ".ym .big{display:block;width:100%;min-height:72px;font-size:1.2rem;font-weight:bold;border:0;border-radius:14px;background:#3b6ab0;color:#fff;margin:12px 0}",
     ".ym .big:disabled{background:#a0aec0}",
     ".ym .chip{font-size:.95rem;padding:8px 12px;border-radius:999px;border:1px solid #cbd5e0;background:#fff;color:#2d3748}",
     ".ym .chip.on{background:#3b6ab0;color:#fff;border-color:#3b6ab0}",
-    ".ym .card{background:#fff;border:2px solid #e2e8f0;border-radius:14px;padding:14px;margin:8px 0;height:38vh;min-height:220px;overflow-y:auto;-webkit-overflow-scrolling:touch}",
+    ".ym .btn{font-size:.95rem;padding:12px 14px;border-radius:10px;border:1px solid #cbd5e0;background:#fff;color:#2d3748;text-decoration:none;display:inline-block;min-height:20px}",
+    ".ym .files{background:#fff;border:1px solid #e2e8f0;border-radius:12px;margin:8px 0}",
+    ".ym .frow{display:flex;align-items:center;gap:10px;padding:12px;border-bottom:1px solid #edf2f7;font-size:.95rem}",
+    ".ym .frow:last-child{border-bottom:0}.ym .frow input{width:22px;height:22px}.ym .frow .h{flex:1}.ym .frow .n{color:#718096;font-size:.85rem}",
+    ".ym .meta{display:flex;justify-content:space-between;align-items:center;gap:8px;font-size:.9rem;color:#4a5568;margin:2px 0 6px}",
+    ".ym .bar{height:6px;background:#e2e8f0;border-radius:3px;margin:0 0 8px;overflow:hidden}.ym .bar i{display:block;height:100%;background:#3b6ab0}",
+    ".ym .card{background:#fff;border:2px solid #e2e8f0;border-radius:14px;padding:12px;margin:8px 0}",
     ".ym .card.star{background:#fffbeb;border-color:#d4a017}",
-    ".ym .card h2{font-size:1.1rem;margin:0 0 8px;line-height:1.4}",
+    ".ym .thumb{display:block;width:100%;height:20vh;min-height:110px;object-fit:cover;border-radius:10px;background:#e2e8f0;margin-bottom:8px}",
+    ".ym .badges{display:flex;gap:8px;align-items:center;margin:0 0 4px;flex-wrap:wrap}",
+    ".ym .score{font-size:.8rem;font-weight:bold;color:#fff;background:#3b6ab0;border-radius:6px;padding:2px 8px}",
+    ".ym .score.s1,.ym .score.s2{background:#a0aec0}.ym .score.s5{background:#d4a017}",
+    ".ym .chan{font-size:.85rem;color:#3b6ab0;font-weight:bold}",
+    ".ym .card h2{font-size:1.1rem;margin:2px 0 8px;line-height:1.4;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}",
     ".ym .plab{font-size:.8rem;color:#718096;margin-bottom:4px}",
-    ".ym .ptext{font-size:1rem;line-height:1.7;background:#fef9c3;border-radius:8px;padding:8px}",
-    ".ym .meta{display:flex;justify-content:space-between;font-size:.9rem;color:#4a5568;margin:4px 0;gap:8px;height:1.4em;white-space:nowrap;overflow:hidden}",
-    ".ym .meta span:last-child{overflow:hidden;text-overflow:ellipsis}",
+    ".ym .ptext{font-size:1rem;line-height:1.6;background:#fef9c3;border-radius:8px;padding:8px;display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden;min-height:4.8em}",
+    ".ym .dline{display:flex;gap:6px;margin:8px 0 2px}",
+    ".ym .dline button{flex:1 1 0;min-width:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:2px;font-size:.85rem;white-space:nowrap;padding:6px 0;border-radius:10px;border:1px solid #cbd5e0;background:#fff;color:#2d3748;min-height:48px}",
+    ".ym .dline button small{font-size:.7rem;color:#718096}",
+    ".ym .dline button.on{background:#3b6ab0;color:#fff;border-color:#3b6ab0}.ym .dline button.on small{color:#e2e8f0}",
+    ".ym .dline button.pin{flex:0 0 40px}",
+    ".ym .why{font-size:.85rem;color:#4a5568;margin:4px 0 8px;min-height:1.3em}",
     ".ym .wide{display:flex;gap:8px;margin:8px 0}",
     ".ym .wide button{flex:1;height:72px;font-size:1.1rem;font-weight:bold;border-radius:14px;border:2px solid #2c5282;background:#fff;color:#1a365d}",
     ".ym .wide button.sel{background:#bee3f8}",
@@ -1772,21 +1929,27 @@
     ".ym .links a,.ym .links button{flex:1;text-align:center;font-size:.95rem;padding:12px 4px;border-radius:10px;border:1px solid #cbd5e0;background:#fff;color:#2d3748;text-decoration:none}",
     ".ym .dock{position:fixed;left:0;right:0;bottom:0;background:#f7fafc;border-top:1px solid #e2e8f0;padding:0 16px calc(8px + env(safe-area-inset-bottom));z-index:30}",
     ".ym .dock-in{max-width:640px;margin:0 auto}",
-    ".ym.listening{padding-bottom:300px}.ym.listening .toast{bottom:calc(290px + env(safe-area-inset-bottom))}",
+    ".ym.listening{padding-bottom:300px}",
+    ".toast{position:fixed;left:12px;right:12px;bottom:calc(12px + env(safe-area-inset-bottom));background:#2d3748;color:#fff;border-radius:10px;padding:10px 12px;font-size:.9rem;display:none;z-index:50;align-items:center;gap:12px}",
+    ".toast.up{bottom:calc(290px + env(safe-area-inset-bottom))}",
+    ".toast.show{display:flex}.toast.warn{background:#c53030}.toast span{flex:1}",
+    ".toast button{font-size:.95rem;font-weight:bold;color:#2d3748;background:#fff;border:0;border-radius:8px;padding:8px 12px}",
+    ".ym .sheet{position:fixed;left:0;right:0;bottom:0;top:12%;background:#fff;border-radius:16px 16px 0 0;box-shadow:0 -4px 20px rgba(0,0,0,.25);padding:14px 14px calc(14px + env(safe-area-inset-bottom));overflow:auto;z-index:40;display:none;-webkit-overflow-scrolling:touch}",
+    ".ym .sheet.show{display:block}",
+    ".ym .sheet h3{margin:12px 0 4px;font-size:.95rem;color:#3b6ab0}",
+    ".ym .sheet .sec{white-space:pre-wrap;line-height:1.7;font-size:1rem;border-radius:8px;padding:6px 8px;margin:2px 0}",
+    ".ym .sheet .sec.hl{background:#fef9c3}",
+    ".ym .sheet .close{position:sticky;top:0;display:block;margin:0 0 8px auto;z-index:2;font-size:1rem;padding:8px 14px;border-radius:10px;border:1px solid #cbd5e0;background:#fff}",
+    ".ym .sheet .foot{display:flex;gap:8px;margin:16px 0 4px}.ym .sheet .foot>*{flex:1;text-align:center;padding:14px 4px;border-radius:10px;border:1px solid #cbd5e0;background:#fff;color:#2d3748;text-decoration:none;font-size:1rem}",
+    ".ym .opt{display:block;width:100%;text-align:left;padding:12px;margin:8px 0;border-radius:10px;border:2px solid #e2e8f0;background:#fff;font-size:1rem}",
+    ".ym .opt.on{border-color:#3b6ab0;background:#ebf4ff}.ym .opt small{display:block;color:#718096;margin-top:4px;font-size:.85rem}",
     ".ym .dinp{display:block;width:100%;box-sizing:border-box;font-size:1rem;padding:10px;margin:8px 0;border:1px solid #cbd5e0;border-radius:8px}",
     ".ym .dnote{font-size:.85rem;color:#718096;margin:4px 0}.ym .dlab{font-size:.8rem;color:#3b6ab0;margin-top:6px}",
     ".ym .dtext{font-size:1rem;line-height:1.6;background:#f1f5f9;border-radius:8px;padding:8px;-webkit-user-select:text;user-select:text}",
     ".ym .dmsg{font-size:.9rem;color:#2f855a;min-height:1.4em;margin:6px 0}.ym .dmsg.warn{color:#c53030}",
     ".ym .ditem{display:flex;align-items:center;gap:8px;padding:6px 0;border-bottom:1px solid #edf2f7}",
     ".ym .dw{font-weight:bold}.ym .dr{flex:1;color:#4a5568}.ym .dtag{font-size:.75rem;color:#718096}",
-    ".ym .dx{font-size:1.1rem;padding:6px 12px;border-radius:8px;border:1px solid #cbd5e0;background:#fff}",
-    ".ym .toast{position:fixed;left:12px;right:12px;bottom:calc(12px + env(safe-area-inset-bottom));background:#2d3748;color:#fff;border-radius:10px;padding:10px 12px;font-size:.9rem;display:none;z-index:50}",
-    ".ym .toast.show{display:block}.ym .toast.warn{background:#c53030}",
-    ".ym .sheet{position:fixed;left:0;right:0;bottom:0;top:12%;background:#fff;border-radius:16px 16px 0 0;box-shadow:0 -4px 20px rgba(0,0,0,.25);padding:14px;overflow:auto;z-index:40;display:none}",
-    ".ym .sheet.show{display:block}",
-    ".ym .sheet h3{margin:12px 0 4px;font-size:.95rem;color:#3b6ab0}",
-    ".ym .sheet .body{white-space:pre-wrap;line-height:1.7;font-size:1rem}",
-    ".ym .sheet .close{position:sticky;top:0;float:right;font-size:1rem;padding:8px 14px;border-radius:10px;border:1px solid #cbd5e0;background:#fff}"
+    ".ym .dx{font-size:1.1rem;padding:6px 12px;border-radius:8px;border:1px solid #cbd5e0;background:#fff}"
   ].join("");
 
   function el(doc, tag, cls, text) {
@@ -1799,6 +1962,12 @@
   function lsSet(k, v) { try { W.localStorage.setItem(k, v); return true; } catch (e) { return false; } }
   function isStarred(item) { return !!item && (item.is_favorite === true || item.category === "Followed Note"); }
 
+  // チャンネル名。末尾の「(登録者数…)」は表示とも要らないので外す(👎👍の記録と同じ整え方)。
+  function channelName(item) {
+    var c = item && typeof item.channel === "string" ? item.channel : "";
+    return c.replace(/\s*[\(（]登録者数[^)）]*[\)）]\s*$/, "").replace(/^\s+|\s+$/g, "");
+  }
+
   function plainBlocks(html) {
     return String(html || "").replace(/<\/(li|p|div|h[1-6]|ul|ol)>/gi, "\n").replace(/<br\s*\/?>/gi, "\n")
       .replace(/<[^>]*>/g, "").replace(/&nbsp;/g, " ").replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">")
@@ -1806,7 +1975,7 @@
   }
 
   // ---- 背景再生(旧UIの bgKeep と同じ方式) ----
-  var bgKeep = { el: null, stopTimer: null, sessionSet: false, wake: null };
+  var bgKeep = { el: null, stopTimer: null, wake: null };
   function wavUrl() {
     var rate = 8000, n = rate, buf = new ArrayBuffer(44 + n * 2), v = new DataView(buf);
     function w(off, s) { for (var i = 0; i < s.length; i++) v.setUint8(off + i, s.charCodeAt(i)); }
@@ -1822,10 +1991,15 @@
       if (bgKeep.el.paused) { var p = bgKeep.el.play(); if (p && p.catch) p.catch(function () { }); }
     } catch (e) { }
     try {
-      if (W.navigator.wakeLock && !bgKeep.wake) {
-        W.navigator.wakeLock.request("screen").then(function (s) { bgKeep.wake = s; }, function () { bgKeep.wake = null; });
+      if (W.navigator.wakeLock && !bgKeep.wake && !bgKeep.asking) {
+        bgKeep.asking = true;
+        W.navigator.wakeLock.request("screen").then(function (s) {
+          bgKeep.asking = false; bgKeep.wake = s;
+          // タブが隠れると、ブラウザが自動で解放する。解放されたら持っている印を外し、戻ったときに取り直せるようにする。
+          try { s.addEventListener("release", function () { if (bgKeep.wake === s) bgKeep.wake = null; }); } catch (e2) { }
+        }, function () { bgKeep.asking = false; bgKeep.wake = null; });
       }
-    } catch (e) { }
+    } catch (e) { bgKeep.asking = false; }
   }
   function bgStopSoon(isPlaying) {
     if (bgKeep.stopTimer) clearTimeout(bgKeep.stopTimer);
@@ -1835,16 +2009,29 @@
       try { if (bgKeep.wake) { bgKeep.wake.release(); bgKeep.wake = null; } } catch (e) { }
     }, 8000);
   }
-  function setMediaSession(api) {
+  function setMediaSession(ctx) {
     if (!("mediaSession" in W.navigator)) return;
+    function act(name) { return function () { if (ctx.player) ctx.player[name](); }; }
     try {
-      W.navigator.mediaSession.metadata = new W.MediaMetadata({ title: "YouTubeサマリーの読み上げ(beta)", artist: "Youtube Manager" });
-      W.navigator.mediaSession.setActionHandler("play", function () { api.play(); });
-      W.navigator.mediaSession.setActionHandler("pause", function () { api.pause(); });
-      W.navigator.mediaSession.setActionHandler("stop", function () { api.pause(); });
-      W.navigator.mediaSession.setActionHandler("nexttrack", function () { api.next(); });
-      W.navigator.mediaSession.setActionHandler("previoustrack", function () { api.prev(); });
+      W.navigator.mediaSession.setActionHandler("play", act("play"));
+      W.navigator.mediaSession.setActionHandler("pause", act("pause"));
+      W.navigator.mediaSession.setActionHandler("stop", act("pause"));
+      W.navigator.mediaSession.setActionHandler("nexttrack", act("next"));
+      W.navigator.mediaSession.setActionHandler("previoustrack", act("prev"));
     } catch (e) { }
+  }
+  // 聴く画面を離れたら、ロック画面・イヤホンの操作を外す(離れた後に勝手に読み始めない)。
+  function clearMediaSession() {
+    if (!("mediaSession" in W.navigator)) return;
+    var names = ["play", "pause", "stop", "nexttrack", "previoustrack"], i;
+    for (i = 0; i < names.length; i++) { try { W.navigator.mediaSession.setActionHandler(names[i], null); } catch (e) { } }
+    try { W.navigator.mediaSession.metadata = null; } catch (e) { }
+  }
+  function safeUrl(u) { return /^https?:\/\//i.test(String(u || "")) ? String(u) : ""; }
+  // ロック画面の表示: 題名・チャンネル・何件目か・深さ。
+  function setMediaMeta(title, artist, album) {
+    if (!("mediaSession" in W.navigator) || !W.MediaMetadata) return;
+    try { W.navigator.mediaSession.metadata = new W.MediaMetadata({ title: title, artist: artist, album: album }); } catch (e) { }
   }
 
   function pickVoice(ut) {
@@ -1865,7 +2052,9 @@
   }
 
   // ---- 状態 ----
-  function buildCtx(doc, data) {
+  function readJson(key) { var s = lsGet(key), o = null; try { o = s ? JSON.parse(s) : null; } catch (e) { o = null; } return o; }
+
+  function buildCtx(doc, data, html) {
     var cards = [], byKey = {}, i, j, ymb = W.YMBeta;
     for (i = 0; i < data.ALL_DATA.length; i++) {
       var f = data.ALL_DATA[i], items = f.items || [];
@@ -1878,10 +2067,15 @@
     }
     var r = parseFloat(lsGet("ymBetaRate"));
     var o = lsGet("ymBetaOrder");
+    var own = readJson("ymBetaFiles");
+    var oldState = readJson(ymb.OLD_STATE_KEY);
     var ctx = {
-      doc: doc, data: data, cards: cards, byKey: byKey, read: {}, migrated: null, saved: true,
+      doc: doc, data: data, cards: cards, byKey: byKey, read: {}, migrated: null, saved: true, builtAt: ymb.parseBuildTime(html),
       rate: (r > 0) ? r : (IS_IOS ? 1.5 : 2.0), order: (o === "newest" || o === "oldest") ? o : "score",
-      player: null, sessionRead: 0, thumbLast: {}, thumbClient: null, dictStore: null, hist: [], lastSource: ""
+      ownFiles: (own && typeof own === "object") ? own : {},
+      oldChecked: (oldState && oldState.checkedFiles && typeof oldState.checkedFiles === "object") ? oldState.checkedFiles : {},
+      player: null, sessionRead: 0, sessionUp: 0, sessionDown: 0, thumbLast: {}, thumbClient: null,
+      dictStore: null, dictClient: null, hist: [], lastSource: "", pinKey: lsGet("ymBetaPin") || null, metaKey: ""
     };
     ctx.migrated = ymb.migrateOld(ymb.loadReadV2(), ymb.loadOldHistory(), data.ALL_DATA, Date.now());
     ctx.read = ctx.migrated.read;
@@ -1909,39 +2103,91 @@
 
   function isReadCard(ctx, c) { return W.YMBeta.isRead(ctx.read, c.item, c.filename, c.iIdx); }
 
-  function markRead(ctx, card) {
+  // 聴くサマリーのチェック: beta で決めたものが先。無ければ旧UIのチェック(外してあるものは外れたまま)。
+  function isChecked(ctx, filename) {
+    if (Object.prototype.hasOwnProperty.call(ctx.ownFiles, filename)) return ctx.ownFiles[filename] !== false;
+    return ctx.oldChecked[filename] !== false;
+  }
+  function checkedMap(ctx) {
+    var m = {}, i;
+    for (i = 0; i < ctx.data.ALL_DATA.length; i++) {
+      var fn = ctx.data.ALL_DATA[i].filename;
+      if (!isChecked(ctx, fn)) m[fn] = false;
+    }
+    return m;
+  }
+
+  function persistRead(ctx) { if (!W.YMBeta.saveReadV2(ctx.read)) ctx.saved = false; }
+
+  function writeOld(pairs) {
     var ymb = W.YMBeta;
-    if (!ctx.read[card.key]) ctx.read[card.key] = Date.now();
-    if (!ymb.saveReadV2(ctx.read)) ctx.saved = false;
-    var pairs = [], same = ctx.byKey[card.key] || [card], i;
-    for (i = 0; i < same.length; i++) pairs.push([same[i].filename, same[i].iIdx]);
     var t = ymb.addOldRead(lsGet(ymb.OLD_STATE_KEY), pairs);
     if (t !== null) lsSet(ymb.OLD_STATE_KEY, t);
-    ctx.sessionRead++;
+  }
+
+  function markRead(ctx, card) {
+    if (!ctx.read[card.key]) { ctx.read[card.key] = Date.now(); ctx.sessionRead++; }
+    persistRead(ctx);
+    var pairs = [], same = ctx.byKey[card.key] || [card], i;
+    for (i = 0; i < same.length; i++) pairs.push([same[i].filename, same[i].iIdx]);
+    writeOld(pairs);
   }
 
   function makePlan(ctx) {
     return W.YMListen.plan(ctx.cards, {
-      order: ctx.order, listenDepth: W.ListenDepth, rate: ctx.rate,
+      order: ctx.order, listenDepth: W.ListenDepth, rate: ctx.rate, checkedFiles: checkedMap(ctx),
       isRead: function (c) { return isReadCard(ctx, c); }
     });
   }
 
-  function unreadCount(ctx) {
-    var n = 0, i;
-    for (i = 0; i < ctx.cards.length; i++) if (!isReadCard(ctx, ctx.cards[i])) n++;
+  function unreadCount(ctx, onlyToday) {
+    var n = 0, i, t0 = W.YMBeta.startOfDay(Date.now()), dayOf = {};
+    for (i = 0; i < ctx.data.ALL_DATA.length; i++) dayOf[ctx.data.ALL_DATA[i].filename] = W.YMBeta.fileDayStart(ctx.data.ALL_DATA[i]);
+    for (i = 0; i < ctx.cards.length; i++) {
+      if (isReadCard(ctx, ctx.cards[i])) continue;
+      if (onlyToday && dayOf[ctx.cards[i].filename] !== t0) continue;
+      n++;
+    }
     return n;
   }
 
-  // ---- 画面 ----
-  function toast(ctx, msg, warn) {
-    var t = ctx.toastEl;
+  // ---- 部品: 下から出るシート・知らせ ----
+  function toast(ctx, msg, warn, action) {
+    var t = ctx.toastEl, doc = ctx.doc;
     if (!t) return;
-    t.textContent = msg;
-    t.className = "toast show" + (warn ? " warn" : "");
+    t.innerHTML = "";
+    t.appendChild(el(doc, "span", "", msg));
+    if (action) {
+      var b = el(doc, "button", "", action.label);
+      b.addEventListener("click", function () { t.className = "toast"; action.run(); });
+      t.appendChild(b);
+    }
+    var up = ctx.root && ctx.root.className.indexOf("listening") >= 0 ? " up" : "";
+    t.className = "toast show" + (warn ? " warn" : "") + up;
     if (ctx.toastTimer) clearTimeout(ctx.toastTimer);
-    ctx.toastTimer = setTimeout(function () { t.className = "toast"; }, 2800);
+    ctx.toastTimer = setTimeout(function () { t.className = "toast"; }, action ? (action.ms || 8000) : 2800);
   }
+
+  function ensureOverlays(ctx) {
+    var doc = ctx.doc;
+    ctx.sheet = el(doc, "div", "sheet"); ctx.root.appendChild(ctx.sheet);
+    // 通知は1つだけ作って body に置く。画面を描き直しても(取り消しボタンごと)消えない。
+    if (!ctx.toastEl) { ctx.toastEl = el(doc, "div", "toast"); doc.body.appendChild(ctx.toastEl); }
+  }
+
+  function openSheet(ctx, mode, title) {
+    var doc = ctx.doc, sh = ctx.sheet;
+    sh.innerHTML = "";
+    sh.setAttribute("data-mode", mode);
+    var close = el(doc, "button", "close", "閉じる");
+    close.addEventListener("click", function () { closeSheet(ctx); });
+    sh.appendChild(close);
+    if (title) sh.appendChild(el(doc, "h2", "", title));
+    sh.className = "sheet show";
+    sh.scrollTop = 0;
+    return sh;
+  }
+  function closeSheet(ctx) { ctx.sheet.className = "sheet"; ctx.sheet.setAttribute("data-mode", ""); }
 
   function selectEl(doc, opts, cur, onChange) {
     var s = el(doc, "select"), i;
@@ -1953,25 +2199,106 @@
     s.addEventListener("change", function () { onChange(s.value); });
     return s;
   }
+  function rateOptions() { var rr = [], i; for (i = 0; i < RATES.length; i++) rr.push([RATES[i], RATES[i] + "倍速"]); return rr; }
+
+  // ---- ホーム ----
+  function fileStats(ctx) {
+    var map = {}, i;
+    for (i = 0; i < ctx.data.ALL_DATA.length; i++) map[ctx.data.ALL_DATA[i].filename] = { file: ctx.data.ALL_DATA[i], total: 0, unread: 0 };
+    for (i = 0; i < ctx.cards.length; i++) {
+      var s = map[ctx.cards[i].filename];
+      if (!s) continue;
+      s.total++;
+      if (!isReadCard(ctx, ctx.cards[i])) s.unread++;
+    }
+    var out = [], k;
+    for (k in map) if (Object.prototype.hasOwnProperty.call(map, k) && map[k].total > 0) out.push(map[k]);
+    out.sort(function (a, b) { return a.file.filename < b.file.filename ? 1 : (a.file.filename > b.file.filename ? -1 : 0); });
+    return out;
+  }
+
+  function fileRow(ctx, s, rerender) {
+    var doc = ctx.doc, row = el(doc, "label", "frow"), cb = el(doc, "input");
+    cb.type = "checkbox"; cb.checked = isChecked(ctx, s.file.filename);
+    cb.addEventListener("change", function () {
+      ctx.ownFiles[s.file.filename] = cb.checked;
+      lsSet("ymBetaFiles", JSON.stringify(ctx.ownFiles));
+      rerender();
+    });
+    row.appendChild(cb);
+    row.appendChild(el(doc, "span", "h", W.YMBeta.fileHeading(s.file)));
+    row.appendChild(el(doc, "span", "n", "未読 " + s.unread + " / " + s.total + "件"));
+    return row;
+  }
+
+  function openOrder(ctx) {
+    var doc = ctx.doc, sh = openSheet(ctx, "order", "読む順"), i;
+    function mk(o) {
+      var b = el(doc, "button", "opt" + (ctx.order === o[0] ? " on" : ""), o[1]);
+      b.appendChild(el(doc, "small", "", o[2]));
+      b.addEventListener("click", function () { ctx.order = o[0]; lsSet("ymBetaOrder", o[0]); closeSheet(ctx); renderHome(ctx); });
+      return b;
+    }
+    for (i = 0; i < ORDERS.length; i++) sh.appendChild(mk(ORDERS[i]));
+    sh.appendChild(el(doc, "div", "dnote", "「▶ 聴く」に効きます。聴くサマリーのチェックを外したサマリーは読みません。"));
+  }
+
+  function openAllFiles(ctx) {
+    var doc = ctx.doc, sh = openSheet(ctx, "files", "聴くサマリー"), stats = fileStats(ctx), box = el(doc, "div", "files"), i;
+    function again() { openAllFiles(ctx); renderHomeBehind(ctx); }
+    for (i = 0; i < stats.length; i++) box.appendChild(fileRow(ctx, stats[i], again));
+    sh.appendChild(el(doc, "div", "dnote", "チェックを外したサマリーは、「▶ 聴く」で読みません。"));
+    sh.appendChild(box);
+  }
+
+  // シートを開いたまま、後ろのホームの数字だけ更新する。
+  function renderHomeBehind(ctx) { if (ctx.refreshHome) ctx.refreshHome(); }
+
+  function markOlderRead(ctx) {
+    var ymb = W.YMBeta, t0 = ymb.startOfDay(Date.now()), list = [], i;
+    for (i = 0; i < ctx.cards.length; i++) {
+      var f = null, k;
+      for (k = 0; k < ctx.data.ALL_DATA.length; k++) if (ctx.data.ALL_DATA[k].filename === ctx.cards[i].filename) { f = ctx.data.ALL_DATA[k]; break; }
+      var day = ymb.fileDayStart(f);
+      if (day !== null && day < t0 && !isReadCard(ctx, ctx.cards[i])) list.push(ctx.cards[i]);
+    }
+    if (!list.length) { toast(ctx, "昨日以前の未読はありません", false); return; }
+    if (!W.confirm("昨日以前のサマリーの未読 " + list.length + "件を、すべて既読にします。よろしいですか(8秒間は取り消せます)")) return;
+    var res = ymb.bulkMark(ctx.read, list, Date.now());
+    ctx.read = res.read; persistRead(ctx); writeOld(res.pairs);
+    renderHome(ctx);
+    toast(ctx, "昨日以前の " + list.length + "件を既読にしました", false, {
+      label: "取り消す", ms: 8000,
+      run: function () {
+        ctx.read = ymb.unmark(ctx.read, res.keys); persistRead(ctx);
+        var t = ymb.removeOldRead(lsGet(ymb.OLD_STATE_KEY), res.pairs);
+        if (t !== null) lsSet(ymb.OLD_STATE_KEY, t);
+        renderHome(ctx);
+        toast(ctx, "取り消しました", false);
+      }
+    });
+  }
 
   function renderHome(ctx) {
-    var doc = ctx.doc, root = ctx.root, m = ctx.migrated, i;
+    var doc = ctx.doc, root = ctx.root, m = ctx.migrated, ymb = W.YMBeta, now = Date.now(), i;
     root.innerHTML = "";
     root.className = "ym";
+    ctx.refreshHome = function () { var keep = ctx.sheet; var toastKeep = ctx.toastEl; renderHomeKeep(ctx, keep, toastKeep); };
     var plan = makePlan(ctx);
-    root.appendChild(el(doc, "h1", "", "YouTubeサマリー beta"));
-    var lines = ["サマリー " + ctx.data.ALL_DATA.length + "枚 / カード " + ctx.cards.length + "件 / 未読 " + unreadCount(ctx) + "件",
-      "既読の移行: 旧UIから +" + m.added + "件(対応先なし " + m.unresolved + "件)"];
-    if (!ctx.saved) lines.push("※既読を保存できませんでした(ブラウザの保存制限)");
-    root.appendChild(el(doc, "pre", "", lines.join("\n")));
 
-    var row = el(doc, "div", "row");
-    row.appendChild(el(doc, "span", "", "並び"));
-    row.appendChild(selectEl(doc, ORDERS, ctx.order, function (v) { ctx.order = v; lsSet("ymBetaOrder", v); renderHome(ctx); }));
-    var rr = [];
-    for (i = 0; i < RATES.length; i++) rr.push([RATES[i], RATES[i] + "倍速"]);
-    row.appendChild(selectEl(doc, rr, ctx.rate, function (v) { ctx.rate = parseFloat(v); lsSet("ymBetaRate", v); renderHome(ctx); }));
-    root.appendChild(row);
+    var eb = "";
+    if (ctx.builtAt) eb = ymb.hhmm(ctx.builtAt) + "に更新(" + ymb.agoLabel(now - ctx.builtAt) + ")・次は" + ymb.hhmm(ymb.nextChain(now, CHAIN_TIMES));
+    if (eb) root.appendChild(el(doc, "div", "eyebrow", eb));
+    root.appendChild(el(doc, "h1", "", "YouTubeサマリー beta"));
+
+    var comp = ctx.data.DASHBOARD_DATA && ctx.data.DASHBOARD_DATA.compass;
+    if (comp && comp.needle_text) {
+      var cb = el(doc, "div", "compass");
+      cb.appendChild(el(doc, "div", "eyebrow", "🧭 本日の方角"));
+      cb.appendChild(el(doc, "div", "t", W.YMListen.stripHtml(comp.needle_text)));
+      if (comp.sub_text) cb.appendChild(el(doc, "div", "dnote", W.YMListen.stripHtml(comp.sub_text)));
+      root.appendChild(cb);
+    }
 
     var b = el(doc, "button", "big", plan.session.length ? ("▶ 聴く " + plan.session.length + "件・" + W.YMListen.minutesLabel(plan.sec)) : "聴く未読がありません");
     b.disabled = !plan.session.length;
@@ -1981,11 +2308,48 @@
     var cnt = {}, q, parts = [], k;
     for (q = 0; q < plan.session.length; q++) cnt[plan.session[q].name] = (cnt[plan.session[q].name] || 0) + 1;
     for (k in cnt) if (Object.prototype.hasOwnProperty.call(cnt, k)) parts.push(k + " " + cnt[k]);
-    root.appendChild(el(doc, "pre", "", "深さ(自動): " + (parts.join(" / ") || "-") + "\n今回に入らない未読: " + plan.rest + "件\n" + W.YMListen.minutesLabel(plan.sec) + "は" + ctx.rate + "倍速の見積もり(15分で区切ります)"));
-    var back = el(doc, "a", "", "従来の画面へ"); back.href = "index.html";
-    root.appendChild(back);
+    var info = "未読 " + unreadCount(ctx, false) + "件(今日の新着 " + unreadCount(ctx, true) + "件)・今回に入らない未読 " + plan.rest + "件\n" +
+      "深さ(自動): " + (parts.join(" / ") || "-") + "\n" + ctx.rate + "倍速の見積もり。15分で区切ります。";
+    if (!ctx.saved) info += "\n※既読を保存できませんでした(ブラウザの保存制限)";
+    root.appendChild(el(doc, "pre", "", info));
+
+    var row = el(doc, "div", "row");
+    var ob = el(doc, "button", "btn", "読む順: " + ORDERS[ctx.order === "score" ? 0 : (ctx.order === "newest" ? 1 : 2)][1] + " ▾");
+    ob.addEventListener("click", function () { openOrder(ctx); });
+    row.appendChild(ob);
+    row.appendChild(selectEl(doc, rateOptions(), ctx.rate, function (v) { ctx.rate = parseFloat(v); lsSet("ymBetaRate", v); renderHome(ctx); }));
+    root.appendChild(row);
+
+    // 今日届いたサマリー(人の言葉の見出し・未読/カード数・聴くかどうかのチェック)
+    var stats = fileStats(ctx), t0 = ymb.startOfDay(now), todays = [];
+    for (i = 0; i < stats.length; i++) if (ymb.fileDayStart(stats[i].file) === t0) todays.push(stats[i]);
+    root.appendChild(el(doc, "div", "eyebrow", "今日届いたサマリー(チェックしたものを聴きます)"));
+    var box = el(doc, "div", "files");
+    if (!todays.length) box.appendChild(el(doc, "div", "frow", "今日のサマリーはまだありません。"));
+    for (i = 0; i < todays.length; i++) box.appendChild(fileRow(ctx, todays[i], function () { renderHome(ctx); }));
+    root.appendChild(box);
+
+    var row2 = el(doc, "div", "row");
+    var all = el(doc, "button", "btn", "すべてのサマリー…");
+    all.addEventListener("click", function () { openAllFiles(ctx); });
+    var older = el(doc, "button", "btn", "昨日以前をすべて既読");
+    older.addEventListener("click", function () { markOlderRead(ctx); });
+    var list = el(doc, "a", "btn", "一覧で見る"); list.href = "index.html";
+    row2.appendChild(all); row2.appendChild(older); row2.appendChild(list);
+    root.appendChild(row2);
+    root.appendChild(el(doc, "div", "dnote", "旧UIからの既読の移行: +" + m.added + "件(対応先なし " + m.unresolved + "件)"));
+    ensureOverlays(ctx);
   }
 
+  // シートを開いたままホームの数字を更新する(聴くサマリーのチェックを切り替えたとき)。
+  function renderHomeKeep(ctx, keepSheet, keepToast) {
+    var open = keepSheet && keepSheet.className.indexOf("show") >= 0, html = keepSheet ? keepSheet.innerHTML : "", mode = keepSheet ? keepSheet.getAttribute("data-mode") : "";
+    renderHome(ctx);
+    if (open && mode === "files") openAllFiles(ctx);
+    else if (open) { ctx.sheet.innerHTML = html; ctx.sheet.className = keepSheet.className; }
+  }
+
+  // ---- 聴く画面 ----
   function ttsPrep(ctx, text) {
     if (!text) return text;
     ctx.lastSource = text;
@@ -2019,42 +2383,231 @@
         return;
       }
       if (r === "rejected") { toast(ctx, "保存できませんでした(形式エラー)", true); return; }
+      if (ctx.thumbLast[row.card_key] === undefined) { if (dir === "up") ctx.sessionUp++; else ctx.sessionDown++; }
       ctx.thumbLast[row.card_key] = dir;
-      updateListen(ctx, ctx.player.state());
+      if (ctx.player) updateListen(ctx, ctx.player.state());
       toast(ctx, word + "を記録: " + row.shown_score + " → " + row.rating + " として扱います" + (r === "queued" ? "(未送信。電波が戻ったら再送します)" : ""), false);
     });
   }
 
-  function openFull(ctx) {
-    var st = ctx.player.state(), e = st.entry;
+  // 全文シート: いま読んでいる部分を黄色で示す。開いている間も読み上げは続き、カードが進めば中身も替わる。
+  function fullKey(st) { return st.entry ? st.entry.card.key + "|" + st.entry.card.filename + "_" + st.entry.card.iIdx : ""; }
+
+  function buildFull(ctx, st) {
+    var e = st.entry, it, doc = ctx.doc, sh = ctx.sheet, secs, i;
     if (!e) return;
-    var it = e.card.item, doc = ctx.doc, sh = ctx.sheet;
+    it = e.card.item;
     sh.innerHTML = "";
     sh.setAttribute("data-mode", "full");
+    ctx.fullKey = fullKey(st);
     var close = el(doc, "button", "close", "閉じる");
-    close.addEventListener("click", function () { sh.className = "sheet"; });
+    close.addEventListener("click", function () { closeSheet(ctx); });
     sh.appendChild(close);
-    sh.appendChild(el(doc, "h2", "", W.YMListen.stripHtml(it.title)));
-    var secs = [["要旨", it.summary], ["結論", it.conclusion], ["主なポイント", it.points]], i;
+    var t = el(doc, "h2", "sec", W.YMListen.stripHtml(it.title)); t.setAttribute("data-part", "title");
+    sh.appendChild(t);
+    if (channelName(it)) sh.appendChild(el(doc, "div", "chan", channelName(it)));
+    secs = [["要旨", it.summary, "summary"], ["結論", it.conclusion, "conclusion"], ["主なポイント", it.points, "points"]];
     for (i = 0; i < secs.length; i++) {
       if (!secs[i][1]) continue;
       sh.appendChild(el(doc, "h3", "", secs[i][0]));
-      sh.appendChild(el(doc, "div", "body", plainBlocks(secs[i][1])));
+      var d = el(doc, "div", "sec", plainBlocks(secs[i][1])); d.setAttribute("data-part", secs[i][2]);
+      sh.appendChild(d);
     }
-    sh.className = "sheet show";
+    var foot = el(doc, "div", "foot");
+    var keep = el(doc, "button", "", "閉じて聴き続ける");
+    keep.addEventListener("click", function () { closeSheet(ctx); if (ctx.player && !ctx.player.state().playing) ctx.player.play(); });
+    foot.appendChild(keep);
+    if (safeUrl(it.url)) {
+      var a = el(doc, "a", "", "🔗 元の記事を開く"); a.href = safeUrl(it.url); a.target = "_blank"; a.rel = "noopener";
+      a.addEventListener("click", function () { ctx.player.pause(); });
+      foot.appendChild(a);
+    }
+    sh.appendChild(foot);
+  }
+
+  function updateFullHighlight(ctx, st) {
+    var sh = ctx.sheet;
+    if (!sh || sh.getAttribute("data-mode") !== "full" || sh.className.indexOf("show") < 0) return;
+    if (ctx.fullKey !== fullKey(st)) { var top = sh.scrollTop; buildFull(ctx, st); sh.className = "sheet show"; sh.scrollTop = 0; }
+    var secs = sh.querySelectorAll(".sec"), i, cur = st.part ? st.part.part : "";
+    for (i = 0; i < secs.length; i++) secs[i].className = "sec" + (secs[i].getAttribute("data-part") === cur ? " hl" : "");
+  }
+
+  function openFull(ctx) {
+    var st = ctx.player.state();
+    if (!st.entry) return;
+    buildFull(ctx, st);
+    ctx.sheet.className = "sheet show";
+    ctx.sheet.scrollTop = 0;
+    updateFullHighlight(ctx, st);
+  }
+
+  // 深さの説明(長押し・ⓘ): 3つの意味と、今回の分を各深さで聴いた場合の合計時間。
+  function openDepthHelp(ctx) {
+    var doc = ctx.doc, sh = openSheet(ctx, "depth", "深さについて"), st = ctx.player.state(), i, k;
+    var items = ctx.sessionPlan ? ctx.sessionPlan.session : [];
+    sh.appendChild(el(doc, "h3", "", "3つの使い方"));
+    sh.appendChild(el(doc, "div", "sec", "🎧 自動 … 点数などから、カードごとに深さを決めます。\nこのカードだけ … 深さのボタンを押す。次のカードからは自動(または📌)に戻ります。\n📌 ずっと … 📌を押すと、今の深さをずっと使います。もう一度押すと外れます。"));
+    sh.appendChild(el(doc, "h3", "", "今回の" + items.length + "件を、この深さで聴くと(" + st.rate + "倍速)"));
+    var d = W.YMListen.DEPTHS;
+    for (i = 0; i < d.length; i++) {
+      var sum = 0;
+      for (k = 0; k < items.length; k++) sum += W.YMListen.estimateSec(items[k].card.item, d[i].depth, st.rate);
+      sh.appendChild(el(doc, "div", "sec", d[i].name + " … " + W.YMListen.minutesLabel(sum)));
+    }
+  }
+
+  function setPinFromCurrent(ctx) {
+    var st = ctx.player.state();
+    if (ctx.pinKey) { ctx.pinKey = null; lsSet("ymBetaPin", ""); }
+    else {
+      var d = st.depthKey || (st.entry ? st.entry.key : null);
+      ctx.pinKey = d; lsSet("ymBetaPin", d || "");
+    }
+    ctx.player.setPin(ctx.pinKey);
+  }
+
+  function renderListen(ctx) {
+    var doc = ctx.doc, root = ctx.root, ui = {}, i;
+    root.innerHTML = "";
+    root.className = "ym listening";
+    ctx.ui = ui;
+
+    ui.head = el(doc, "div", "meta");
+    ui.pos = el(doc, "span");
+    ui.rate = selectEl(doc, rateOptions(), ctx.rate, function (v) { ctx.rate = parseFloat(v); lsSet("ymBetaRate", v); ctx.player.setRate(ctx.rate); });
+    ui.head.appendChild(ui.pos); ui.head.appendChild(ui.rate);
+    root.appendChild(ui.head);
+    var bar = el(doc, "div", "bar"); ui.fill = el(doc, "i"); bar.appendChild(ui.fill); root.appendChild(bar);
+
+    ui.card = el(doc, "div", "card");
+    ui.thumb = el(doc, "img", "thumb"); ui.thumb.alt = "";
+    ui.thumb.addEventListener("click", function () { openFull(ctx); });
+    ui.badges = el(doc, "div", "badges");
+    ui.score = el(doc, "span", "score"); ui.chan = el(doc, "span", "chan");
+    ui.badges.appendChild(ui.score); ui.badges.appendChild(ui.chan);
+    ui.title = el(doc, "h2"); ui.title.addEventListener("click", function () { openFull(ctx); });
+    ui.plab = el(doc, "div", "plab"); ui.ptext = el(doc, "div", "ptext");
+    ui.card.appendChild(ui.thumb); ui.card.appendChild(ui.badges); ui.card.appendChild(ui.title); ui.card.appendChild(ui.plab); ui.card.appendChild(ui.ptext);
+    root.appendChild(ui.card);
+
+    // 深さの列: 🎧自動 / 題名 / 要旨 / ＋結論 / 全部(それぞれ約N分) / 📌 / ⓘ
+    ui.dline = el(doc, "div", "dline");
+    ui.chips = {};
+    function mkChip(key, name) {
+      var b = el(doc, "button", "", name);
+      b.appendChild(el(doc, "small", "", ""));
+      b.addEventListener("click", function () { ctx.player.setDepth(key || null); });
+      ui.chips[key] = b; ui.dline.appendChild(b);
+    }
+    mkChip("", "自動");
+    for (i = 0; i < W.YMListen.DEPTHS.length; i++) mkChip(W.YMListen.DEPTHS[i].key, W.YMListen.DEPTHS[i].name);
+    ui.pin = el(doc, "button", "pin", "📌"); ui.pin.addEventListener("click", function () { setPinFromCurrent(ctx); });
+    ui.info = el(doc, "button", "pin", "ⓘ"); ui.info.addEventListener("click", function () { openDepthHelp(ctx); });
+    ui.dline.appendChild(ui.pin); ui.dline.appendChild(ui.info);
+    // 長押しでも説明を開く(0.5秒)
+    var pressT = null, swallow = false;
+    ui.dline.addEventListener("click", function (ev) { if (swallow) { swallow = false; ev.preventDefault(); ev.stopPropagation(); } }, true);
+    ui.dline.addEventListener("touchstart", function () { swallow = false; pressT = setTimeout(function () { pressT = null; swallow = true; openDepthHelp(ctx); }, 500); }, { passive: true });
+    ui.dline.addEventListener("touchend", function () { if (pressT) { clearTimeout(pressT); pressT = null; } });
+    ui.dline.addEventListener("touchmove", function () { if (pressT) { clearTimeout(pressT); pressT = null; } }, { passive: true });
+    root.appendChild(ui.dline);
+    ui.why = el(doc, "div", "why"); root.appendChild(ui.why);
+
+    var home = el(doc, "div", "links");
+    var hb = el(doc, "button", "", "ホームへ戻る");
+    hb.addEventListener("click", function () { leaveListen(ctx); });
+    home.appendChild(hb);
+    root.appendChild(home);
+
+    // 操作のボタンは画面の下に固定する。カードの文の長さが変わっても、ボタンは動かない。
+    var dock = el(doc, "div", "dock"), dockIn = el(doc, "div", "dock-in");
+    dock.appendChild(dockIn);
+    var th = el(doc, "div", "wide");
+    ui.down = el(doc, "button", "", "👎 よくない"); ui.up = el(doc, "button", "", "👍 いいね");
+    ui.down.addEventListener("click", function () { thumbPress(ctx, "down"); });
+    ui.up.addEventListener("click", function () { thumbPress(ctx, "up"); });
+    th.appendChild(ui.down); th.appendChild(ui.up);
+    dockIn.appendChild(th);
+
+    var nav = el(doc, "div", "wide");
+    var prev = el(doc, "button", "", "⏮ 前"); ui.play = el(doc, "button", "main", "⏸ 停止"); var next = el(doc, "button", "", "次 ⏭");
+    prev.addEventListener("click", function () { ctx.player.prev(); });
+    next.addEventListener("click", function () { ctx.player.next(); });
+    ui.play.addEventListener("click", function () { if (ctx.player.state().playing) ctx.player.pause(); else ctx.player.play(); });
+    nav.appendChild(prev); nav.appendChild(ui.play); nav.appendChild(next);
+    dockIn.appendChild(nav);
+
+    var links = el(doc, "div", "links");
+    var full = el(doc, "button", "", "📄 全文");
+    full.addEventListener("click", function () { openFull(ctx); });
+    ui.src = el(doc, "a", "", "🔗 元の記事"); ui.src.target = "_blank"; ui.src.rel = "noopener";
+    ui.src.addEventListener("click", function () { ctx.player.pause(); });      // 元の記事を開くときは読み上げを止める
+    var rd = el(doc, "button", "", "🗣 読み方");
+    rd.addEventListener("click", function () { openDict(ctx); });
+    links.appendChild(full); links.appendChild(ui.src); links.appendChild(rd);
+    dockIn.appendChild(links);
+    root.appendChild(dock);
+
+    ensureOverlays(ctx);
+  }
+
+  function updateListen(ctx, st) {
+    var ui = ctx.ui, e = st.entry, it, key, per, i;
+    if (!ui || !e) return;
+    it = e.card.item;
+    ui.pos.textContent = (st.i + 1) + " / " + st.total + "件・残り" + W.YMListen.minutesLabel(st.remainingSec);
+    ui.fill.style.width = Math.round(100 * st.i / Math.max(1, st.total)) + "%";
+    ui.card.className = "card" + (isStarred(it) ? " star" : "");
+    if (it.thumbnail) { if (ui.thumb.getAttribute("src") !== it.thumbnail) ui.thumb.src = it.thumbnail; ui.thumb.style.display = ""; }
+    else ui.thumb.style.display = "none";
+    var sc = it.ai && typeof it.ai.s === "number" ? it.ai.s : null;
+    ui.score.textContent = sc === null ? "" : ("AI " + sc);
+    ui.score.className = "score" + (sc === null ? "" : " s" + sc);
+    ui.score.style.display = sc === null ? "none" : "";
+    ui.chan.textContent = channelName(it) + (it.duration ? (channelName(it) ? "・" : "") + it.duration : "");
+    ui.title.textContent = W.YMListen.stripHtml(it.title);
+    var pn = { title: "題名", summary: "要旨", conclusion: "結論", points: "主なポイント" };
+    ui.plab.textContent = st.part ? ("いま読んでいる部分: " + pn[st.part.part]) : "";
+    ui.ptext.textContent = st.part ? st.part.text : "";
+    ui.play.textContent = st.playing ? "⏸ 停止" : "▶ 再生";
+
+    // 深さの列: 各深さの約N分(このカード)、いま効いている深さを青く。
+    per = W.YMListen.perDepth(it, st.rate);
+    var eff = st.depthKey || st.pinKey || e.key;
+    for (key in ui.chips) if (Object.prototype.hasOwnProperty.call(ui.chips, key)) {
+      var b = ui.chips[key], small = b.lastChild, on;
+      if (key === "") { on = !st.depthKey && !st.pinKey; small.textContent = e.name; }
+      else {
+        on = (key === eff) && (key === st.depthKey || (!st.depthKey && !!st.pinKey && key === st.pinKey) || false);
+        for (i = 0; i < per.length; i++) if (per[i].key === key) small.textContent = per[i].label;
+      }
+      b.className = on ? "on" : "";
+    }
+    ui.pin.className = "pin" + (st.pinKey ? " on" : "");
+    ui.why.textContent = st.depthKey ? ("このカードだけ「" + st.depthName + "」") :
+      (st.pinKey ? ("📌 ずっと「" + st.depthName + "」") : ("🎧自動: " + e.why + " → " + e.name));
+
+    if (safeUrl(it.url)) { ui.src.href = safeUrl(it.url); ui.src.style.display = ""; } else ui.src.style.display = "none";
+    var k = W.YtLabels ? W.YtLabels.cardKey(it) : "";
+    ui.up.className = (k && ctx.thumbLast[k] === "up") ? "sel" : "";
+    ui.down.className = (k && ctx.thumbLast[k] === "down") ? "sel" : "";
+
+    // ロック画面: 題名・チャンネル・何件目か・深さ
+    var mk = st.i + "|" + st.depthName;
+    if (ctx.metaKey !== mk) {
+      ctx.metaKey = mk;
+      setMediaMeta(W.YMListen.stripHtml(it.title), channelName(it) || "YouTubeサマリー", (st.i + 1) + "/" + st.total + "件・" + st.depthName);
+    }
+    updateFullHighlight(ctx, st);
   }
 
   // ---- 読み方の登録(旧UIと同じ辞書: 端末に保存し、共有の辞書にも送る) ----
   function openDict(ctx) {
-    var store = ctx.dictStore, doc = ctx.doc, sh = ctx.sheet, i;
+    var store = ctx.dictStore, doc = ctx.doc, i;
     if (!store || !W.TtsUserDict) { toast(ctx, "読み方の部品を読み込めませんでした", true); return; }
     if (ctx.player) ctx.player.pause();      // 登録中は読み上げを止める(続きは再生ボタンで)
-    sh.innerHTML = "";
-    sh.setAttribute("data-mode", "dict");
-    var close = el(doc, "button", "close", "閉じる");
-    close.addEventListener("click", function () { sh.className = "sheet"; sh.setAttribute("data-mode", ""); });
-    sh.appendChild(close);
-    sh.appendChild(el(doc, "h2", "", "読み方を登録"));
+    var sh = openSheet(ctx, "dict", "読み方を登録");
 
     sh.appendChild(el(doc, "h3", "", "直前に読み上げた文"));
     var histBox = el(doc, "div", "dhist");
@@ -2154,10 +2707,11 @@
     if (!ctx.dictSelBound) {
       ctx.dictSelBound = true;
       doc.addEventListener("selectionchange", function () {
-        if (sh.getAttribute("data-mode") !== "dict" || !sh.classList.contains("show")) return;
+        var s2 = ctx.sheet;
+        if (!s2 || s2.getAttribute("data-mode") !== "dict" || s2.className.indexOf("show") < 0) return;
         var sel = W.getSelection ? W.getSelection() : null;
         if (!sel || sel.isCollapsed || !sel.anchorNode) return;
-        var wi = sh.querySelector("input.dinp"), hb = sh.querySelector(".dhist");
+        var wi = s2.querySelector("input.dinp"), hb = s2.querySelector(".dhist");
         if (!wi || !hb || !hb.contains(sel.anchorNode)) return;
         var t = sel.toString().replace(/^\s+|\s+$/g, "");
         if (t && t.length <= 40) wi.value = t;
@@ -2165,126 +2719,50 @@
     }
 
     renderList();
-    sh.className = "sheet show";
-    sh.scrollTop = 0;
     sync();
   }
 
-  function renderListen(ctx, plan) {
-    var doc = ctx.doc, root = ctx.root, ui = {};
-    root.innerHTML = "";
-    root.className = "ym listening";
-    ctx.ui = ui;
-    ui.head = el(doc, "div", "meta");
-    ui.pos = el(doc, "span"); ui.dname = el(doc, "span");
-    ui.head.appendChild(ui.pos); ui.head.appendChild(ui.dname);
-    root.appendChild(ui.head);
-
-    var chips = el(doc, "div", "row");
-    ui.chips = {};
-    var defs = [["", "自動"]], i;
-    for (i = 0; i < W.YMListen.DEPTHS.length; i++) defs.push([W.YMListen.DEPTHS[i].key, W.YMListen.DEPTHS[i].name]);
-    function mkChip(k, label) {
-      var b = el(doc, "button", "chip", label);
-      b.addEventListener("click", function () { ctx.player.setDepth(k || null); });
-      ui.chips[k] = b; chips.appendChild(b);
-    }
-    for (i = 0; i < defs.length; i++) mkChip(defs[i][0], defs[i][1]);
-    root.appendChild(chips);
-
-    ui.card = el(doc, "div", "card");
-    ui.title = el(doc, "h2"); ui.plab = el(doc, "div", "plab"); ui.ptext = el(doc, "div", "ptext");
-    ui.card.appendChild(ui.title); ui.card.appendChild(ui.plab); ui.card.appendChild(ui.ptext);
-    root.appendChild(ui.card);
-
-    var home = el(doc, "div", "links");
-    var hb = el(doc, "button", "", "ホームへ戻る");
-    hb.addEventListener("click", function () { leaveListen(ctx); });
-    home.appendChild(hb);
-    root.appendChild(home);
-
-    // 操作のボタンは画面の下に固定する。カードの文の長さが変わっても、ボタンは動かない。
-    var dock = el(doc, "div", "dock"), dockIn = el(doc, "div", "dock-in");
-    dock.appendChild(dockIn);
-    var th = el(doc, "div", "wide");
-    ui.down = el(doc, "button", "", "👎 よくない"); ui.up = el(doc, "button", "", "👍 いいね");
-    ui.down.addEventListener("click", function () { thumbPress(ctx, "down"); });
-    ui.up.addEventListener("click", function () { thumbPress(ctx, "up"); });
-    th.appendChild(ui.down); th.appendChild(ui.up);
-    dockIn.appendChild(th);
-
-    var nav = el(doc, "div", "wide");
-    var prev = el(doc, "button", "", "⏮ 前"); ui.play = el(doc, "button", "main", "⏸ 停止"); var next = el(doc, "button", "", "次 ⏭");
-    prev.addEventListener("click", function () { ctx.player.prev(); });
-    next.addEventListener("click", function () { ctx.player.next(); });
-    ui.play.addEventListener("click", function () { if (ctx.player.state().playing) ctx.player.pause(); else ctx.player.play(); });
-    nav.appendChild(prev); nav.appendChild(ui.play); nav.appendChild(next);
-    dockIn.appendChild(nav);
-
-    var links = el(doc, "div", "links");
-    var full = el(doc, "button", "", "📄 全文");
-    full.addEventListener("click", function () { openFull(ctx); });
-    ui.src = el(doc, "a", "", "🔗 元の記事"); ui.src.target = "_blank"; ui.src.rel = "noopener";
-    ui.src.addEventListener("click", function () { ctx.player.pause(); });      // 元の記事を開くときは読み上げを止める
-    var rd = el(doc, "button", "", "🗣 読み方");
-    rd.addEventListener("click", function () { openDict(ctx); });
-    links.appendChild(full); links.appendChild(ui.src); links.appendChild(rd);
-    dockIn.appendChild(links);
-    root.appendChild(dock);
-
-    ctx.sheet = el(doc, "div", "sheet"); root.appendChild(ctx.sheet);
-    ctx.toastEl = el(doc, "div", "toast"); root.appendChild(ctx.toastEl);
-  }
-
-  function updateListen(ctx, st) {
-    var ui = ctx.ui, e = st.entry, it, key;
-    if (!ui || !e) return;
-    it = e.card.item;
-    ui.pos.textContent = (st.i + 1) + " / " + st.total;
-    ui.dname.textContent = "深さ " + st.depthName + (st.auto ? "(自動: " + e.why + ")" : "(手動)");
-    for (key in ui.chips) if (Object.prototype.hasOwnProperty.call(ui.chips, key)) {
-      ui.chips[key].className = "chip" + (((st.auto && key === "") || (!st.auto && key === st.depthKey)) ? " on" : "");
-    }
-    ui.card.className = "card" + (isStarred(it) ? " star" : "");
-    ui.title.textContent = W.YMListen.stripHtml(it.title);
-    var pn = { title: "題名", summary: "要旨", conclusion: "結論", points: "主なポイント" };
-    ui.plab.textContent = st.part ? ("いま読んでいる部分: " + pn[st.part.part]) : "";
-    ui.ptext.textContent = st.part ? st.part.text : "";
-    ui.play.textContent = st.playing ? "⏸ 停止" : "▶ 再生";
-    if (it.url) { ui.src.href = it.url; ui.src.style.display = ""; } else ui.src.style.display = "none";
-    var k = W.YtLabels ? W.YtLabels.cardKey(it) : "";
-    ui.up.className = (k && ctx.thumbLast[k] === "up") ? "sel" : "";
-    ui.down.className = (k && ctx.thumbLast[k] === "down") ? "sel" : "";
-  }
-
+  // ---- 終わり・離れる・始める ----
   function renderEnd(ctx) {
     var doc = ctx.doc, root = ctx.root;
     root.innerHTML = "";
     root.className = "ym";
     root.appendChild(el(doc, "h1", "", "ここまで聴きました"));
     var plan = makePlan(ctx);
-    root.appendChild(el(doc, "pre", "", "この回で既読にしたカード: " + ctx.sessionRead + "件\n残りの未読: " + plan.total + "件"));
+    root.appendChild(el(doc, "pre", "", "この回で既読にしたカード: " + ctx.sessionRead + "件\n👍 " + ctx.sessionUp + "件 / 👎 " + ctx.sessionDown + "件\n残りの未読: " + plan.total + "件"));
     if (plan.session.length) {
-      var more = el(doc, "button", "big", "▶ 続けて聴く " + plan.session.length + "件・" + W.YMListen.minutesLabel(plan.sec));
+      var more = el(doc, "button", "big", "▶ 続けて聴く(次の" + plan.session.length + "件・" + W.YMListen.minutesLabel(plan.sec) + ")");
       more.addEventListener("click", function () { startListening(ctx, plan); });
       root.appendChild(more);
     }
     var hb = el(doc, "button", "chip", "ホームへ戻る");
     hb.addEventListener("click", function () { renderHome(ctx); });
     root.appendChild(hb);
-    ctx.toastEl = el(doc, "div", "toast"); root.appendChild(ctx.toastEl);
+    ensureOverlays(ctx);
+  }
+
+  // 聴き終わりを声でも知らせる(画面を見ていなくても分かるように)。
+  function announceEnd(ctx) {
+    setTimeout(function () {      // 「次」で終わったときは、直前に cancel しているので、少し間を空ける(iOSは直後の speak が落ちる)
+      try {
+        var ut = new W.SpeechSynthesisUtterance("聴き終わりました。");
+        ut.rate = ctx.rate; pickVoice(ut);
+        W.speechSynthesis.speak(ut);
+      } catch (e) { }
+    }, 80);
   }
 
   function leaveListen(ctx) {
     if (ctx.player) { ctx.player.destroy(); ctx.player = null; }
+    clearMediaSession();
     bgStopSoon(function () { return false; });
     renderHome(ctx);
   }
 
   function startListening(ctx, plan) {
     if (ctx.player) ctx.player.destroy();
-    ctx.sessionRead = 0;
-    renderListen(ctx, plan);
+    ctx.sessionRead = 0; ctx.sessionUp = 0; ctx.sessionDown = 0; ctx.sessionPlan = plan; ctx.metaKey = ""; ctx.fullKey = "";
+    renderListen(ctx);
     var p = W.YMPlayer.create({
       items: plan.session, listen: W.YMListen, synth: W.speechSynthesis,
       newUtterance: function (t) { return new W.SpeechSynthesisUtterance(t); },
@@ -2292,10 +2770,12 @@
       bg: { start: bgStart, stopSoon: function () { bgStopSoon(function () { return ctx.player && ctx.player.state().playing; }); } },
       onChange: function (st) { updateListen(ctx, st); },
       onCardEnd: function (e) { markRead(ctx, e.card); },
-      onFinish: function () { renderEnd(ctx); }
+      onFinish: function () { announceEnd(ctx); renderEnd(ctx); },
+      onError: function (why) { toast(ctx, "読み上げできませんでした(" + why + ")。▶ で再開できます", true); }
     });
     ctx.player = p;
-    setMediaSession(p);
+    if (ctx.pinKey) p.setPin(ctx.pinKey);
+    setMediaSession(ctx);
     updateListen(ctx, p.state());
     p.play();      // 「▶ 聴く」を押した操作の中で始める(iOSは、押した操作の中でないと音を出せない)
   }
@@ -2306,16 +2786,20 @@
     root.className = "ym";
     function say(t) { root.innerHTML = ""; root.appendChild(el(doc, "pre", "", t)); }
     say("index.html を読み込み中…");
+    // 画面に戻ってきたとき、読み上げ中なら画面スリープ抑止を取り直す(タブが隠れると自動で解放されるため)。
+    doc.addEventListener("visibilitychange", function () {
+      if (doc.visibilityState === "visible" && W.ymCtx && W.ymCtx.player && W.ymCtx.player.state().playing) bgStart();
+    });
     W.fetch("index.html", { cache: "no-cache" }).then(function (r) {
       if (!r.ok) throw new Error("HTTP " + r.status);
       return r.text();
     }).then(function (html) {
       var d = W.YMBeta.extractData(html);
       if (!d) { say("index.html にデータの目印がありません。公開バッチを一度実行してください。"); return; }
-      var ctx = buildCtx(doc, d);
+      var ctx = buildCtx(doc, d, html);
       ctx.root = root;
-      renderHome(ctx);
       W.ymCtx = ctx;
+      renderHome(ctx);
     }).catch(function (e) { say("読み込みに失敗しました: " + e); });
   }
 
