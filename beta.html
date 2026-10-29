@@ -2307,6 +2307,10 @@
       cb.appendChild(el(doc, "div", "eyebrow", "🧭 本日の方角"));
       cb.appendChild(el(doc, "div", "t", W.YMListen.stripHtml(comp.needle_text)));
       if (comp.sub_text) cb.appendChild(el(doc, "div", "dnote", W.YMListen.stripHtml(comp.sub_text)));
+      var cText = W.YMListen.stripHtml(comp.needle_text) + (comp.sub_text ? "\n" + W.YMListen.stripHtml(comp.sub_text) : "");
+      var cBtn = el(doc, "button", "btn", ctx.compassOn ? "⏹ 止める" : "🔊 聴く"); cBtn.id = "ymCompassBtn";
+      cBtn.addEventListener("click", function () { toggleCompass(ctx, cText, cBtn); });
+      cb.appendChild(cBtn);
       root.appendChild(cb);
     }
 
@@ -2922,7 +2926,34 @@
     renderHome(ctx);
   }
 
+  // 本日の方角を読み上げる(ボタンで始め・止め)。聴く画面に入る前に必ず止める。
+  function stopCompass(ctx) {
+    ctx.cgen = (ctx.cgen || 0) + 1;
+    if (ctx.compassOn) { ctx.compassOn = false; try { W.speechSynthesis.cancel(); } catch (e) { } }
+  }
+  function toggleCompass(ctx, text, btn) {
+    if (ctx.compassOn) { stopCompass(ctx); btn.textContent = "🔊 聴く"; return; }
+    var parts = (String(text).match(/[^。]*。|[^。]+$/g) || []).filter(function (x) { return x.replace(/\s/g, ""); }), gen = (ctx.cgen = (ctx.cgen || 0) + 1), i = 0;
+    if (!parts.length || !W.speechSynthesis) return;
+    ctx.compassOn = true; btn.textContent = "⏹ 止める";
+    try { W.speechSynthesis.cancel(); } catch (e) { }
+    function fin() { if (ctx.cgen !== gen) return; ctx.compassOn = false; var b = ctx.doc.getElementById("ymCompassBtn"); if (b) b.textContent = "🔊 聴く"; bgStopSoon(function () { return false; }); }
+    function next() {
+      if (ctx.cgen !== gen) return;
+      if (i >= parts.length) { fin(); return; }
+      var ut = new W.SpeechSynthesisUtterance(ttsPrep(ctx, parts[i++]));
+      pickVoice(ut); ut.rate = ctx.rate;
+      var called = false;
+      function go() { if (called) return; called = true; setTimeout(next, 10); }
+      ut.onend = go; ut.onerror = function (ev) { if (ev && (ev.error === "interrupted" || ev.error === "canceled")) return; ctx.compassOn = false; fin(); };
+      try { W.speechSynthesis.speak(ut); } catch (e) { fin(); }
+    }
+    bgStart();
+    setTimeout(next, 80);
+  }
+
   function startListening(ctx, plan) {
+    stopCompass(ctx);
     if (ctx.player) ctx.player.destroy();
     ctx.sessionRead = 0; ctx.sessionUp = 0; ctx.sessionDown = 0; ctx.sessionPlan = plan; ctx.metaKey = ""; ctx.fullKey = "";
     renderListen(ctx);
