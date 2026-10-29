@@ -1,0 +1,516 @@
+<!DOCTYPE html>
+<html lang="ja"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover"><title>YouTubeサマリー beta</title></head>
+<body style="font-family:sans-serif;background:#f7fafc;color:#1a202c;padding:16px;">
+<h1 style="font-size:1.1rem;">YouTubeサマリー beta</h1>
+<pre id="ym-status" style="white-space:pre-wrap;font-size:0.9rem;"></pre>
+<p><a href="index.html">従来の画面へ</a></p>
+<script>/*
+ * listen_depth.js - 聴くモードの「読む深さ」の決め打ち。依存なし・独立(統合HTMLに埋め込む / node でテストする)。
+ *
+ * 深さ(4段階。数字が小さいほど深い):
+ *   1 = ▶    主なポイントこみ
+ *   2 = ▶▶＋  結論まで(要旨→結論)。▶▶ より長く、▶ より短い
+ *   3 = ▶▶   要旨こみ
+ *   4 = ▶▶▶  タイトルのみ
+ * 入力 (item) :
+ *   category   ファイルのカテゴリ(V S A B M N Short BBT PODCAST RSS)。大文字小文字は問わない
+ *   type       'youtube' | 'podcast' | 'rss'(categoryが不明なときの代用)
+ *   duration   動画時間の文字列("27:35" "1:02:45")。YouTubeの①長さ
+ *   aiScore    AI分析の1〜5(②テーマ)
+ *   rssJudge   RSSの判定0〜100点(③。AI分析の1〜5とは別の指標)
+ *   starred    ゴールドカード(★。YouTubeのお気に入り / RSSのFollowed Note)
+ *
+ * ルール(越智さん指定 2026-10-10):
+ *   ① 長さ(既存のインジケーター🟩の数 = 0〜5。≦3分=0 / ≦15分=1 / ≦30分=2 / ≦45分=3 / ≦60分=4 / それ以上=5)
+ *        5→▶  4→▶▶＋  3→▶▶  2→▶▶▶  1→▶▶▶  0→▶▶▶
+ *   ② AI分析   5→▶  4→▶▶＋  3→▶▶  2→▶▶▶  1→▶▶▶
+ *   ③ RSS判定  ≧90→▶  ≧80→▶▶＋  ≧70→▶▶  ≧60→▶▶▶  ≦59→▶▶▶
+ *   ★付き: ①②③にかかわらず、少なくとも▶▶＋(高い方=深い方を採る。▶になるものは▶のまま)
+ *   Podcast・BBT は常に▶。N・Short は常に▶▶▶(★があっても)。RSSは②③★の深い方。V S A B M は①②★の深い方。
+ *   材料が1つも無いカード(分析が間に合っていない等)は▶▶。1つだけ有るときはその材料で決める。
+ *
+ * 古いiOS Safariで構文エラーになる記法(アロー関数・let/const・?.・??・replaceAll・後読み)は使わない。
+ */
+(function (root, factory) {
+  var api = factory();
+  if (typeof module === "object" && module && module.exports) module.exports = api;
+  else root.ListenDepth = api;
+})(typeof self !== "undefined" ? self : this, function () {
+  "use strict";
+
+  var POINTS = 1, CONCLUSION = 2, SUMMARY = 3, TITLE = 4;
+  var LABELS = { 1: "▶", 2: "▶▶＋", 3: "▶▶", 4: "▶▶▶" };
+  var NAMES = { 1: "主なポイントこみ", 2: "結論まで", 3: "要旨こみ", 4: "タイトルのみ" };
+
+  /** 動画時間の文字列 → 既存インジケーターの🟩の数(0〜5)。読めなければ null。 */
+  function durationLevel(duration) {
+    if (!duration || typeof duration !== "string") return null;
+    var parts = duration.trim().split(":");
+    var nums = [];
+    for (var i = 0; i < parts.length; i++) {
+      var n = Number(parts[i]);
+      if (parts[i].trim() === "" || isNaN(n) || n < 0) return null;
+      nums.push(n);
+    }
+    var sec;
+    if (nums.length === 3) sec = nums[0] * 3600 + nums[1] * 60 + nums[2];
+    else if (nums.length === 2) sec = nums[0] * 60 + nums[1];
+    else return null;
+    var min = sec / 60;
+    if (min <= 3) return 0;
+    if (min <= 15) return 1;
+    if (min <= 30) return 2;
+    if (min <= 45) return 3;
+    if (min <= 60) return 4;
+    return 5;
+  }
+
+  function depthFromLength(level) {
+    if (level === null || level === undefined) return null;
+    if (level >= 5) return POINTS;
+    if (level >= 4) return CONCLUSION;
+    if (level >= 3) return SUMMARY;
+    return TITLE;
+  }
+
+  function depthFromTheme(score) {
+    if (typeof score !== "number" || isNaN(score)) return null;
+    if (score >= 5) return POINTS;
+    if (score >= 4) return CONCLUSION;
+    if (score >= 3) return SUMMARY;
+    return TITLE;
+  }
+
+  function depthFromJudge(judge) {
+    if (typeof judge !== "number" || isNaN(judge)) return null;
+    if (judge >= 90) return POINTS;
+    if (judge >= 80) return CONCLUSION;
+    if (judge >= 70) return SUMMARY;
+    return TITLE;
+  }
+
+  function deeper(a, b) {      // null は「材料なし」。数字が小さい方が深い
+    if (a === null) return b;
+    if (b === null) return a;
+    return Math.min(a, b);
+  }
+
+  function norm(category) {
+    return String(category || "").replace(/^\s+|\s+$/g, "").toUpperCase();
+  }
+
+  function dots(n) {
+    var s = "";
+    for (var i = 0; i < 5; i++) s += (i < n ? "●" : "○");
+    return s;
+  }
+
+  /** カードの深さを返す: { depth: 1〜4, label: "▶▶＋", name: "結論まで", why: "長さ●●●●○・分析4・★" } */
+  function decide(item) {
+    item = item || {};
+    var cat = norm(item.category);
+    var kind = String(item.type || "").toLowerCase();
+    var len = durationLevel(item.duration);
+    var theme = (typeof item.aiScore === "number") ? item.aiScore : null;
+    var judge = (typeof item.rssJudge === "number") ? item.rssJudge : null;
+    var star = item.starred === true;
+    var starDepth = star ? CONCLUSION : null;
+    var depth, why;
+
+    if (cat === "PODCAST" || cat === "BBT" || (!cat && kind === "podcast")) {
+      depth = POINTS; why = (cat === "BBT" ? "BBT" : "Podcast") + "は常に主なポイントまで";
+    } else if (cat === "N" || cat === "SHORT") {
+      depth = TITLE; why = (cat === "N" ? "N" : "Short") + "はタイトルのみ";
+    } else if (cat === "RSS" || (!cat && kind === "rss")) {
+      depth = deeper(deeper(depthFromTheme(theme), depthFromJudge(judge)), starDepth);
+      why = "分析" + (theme === null ? "なし" : theme) + "・判定" + (judge === null ? "なし" : judge) + (star ? "・★" : "");
+    } else {
+      depth = deeper(deeper(depthFromLength(len), depthFromTheme(theme)), starDepth);
+      why = "長さ" + (len === null ? "不明" : dots(len)) + "・分析" + (theme === null ? "なし" : theme) + (star ? "・★" : "");
+    }
+    if (depth === null) { depth = SUMMARY; why = "材料なし(標準)"; }
+    return { depth: depth, label: LABELS[depth], name: NAMES[depth], why: why };
+  }
+
+  /** 深さ(1〜4) → 既存の skipMode(1=▶の一時 / 4=結論まで / 0=▶▶ / 3=▶▶▶)。 */
+  function skipModeFor(depth) {
+    if (depth === POINTS) return 1;
+    if (depth === CONCLUSION) return 4;
+    if (depth === TITLE) return 3;
+    return 0;
+  }
+
+  return {
+    decide: decide, durationLevel: durationLevel, skipModeFor: skipModeFor,
+    LABELS: LABELS, NAMES: NAMES
+  };
+});
+</script>
+<script>/*
+ * beta_listen.js - 新UI(beta)の聴くモードの計算部分(3-2 深さの言葉化、3-1 の読む順・15分の区切り)。
+ * 依存なし・独立(beta.html に埋め込む / node でテストする)。深さの自動判定は ListenDepth(listen_depth.js)を渡して使う。
+ *
+ * 深さの呼び名(モックアップv4で決定): 題名 / 要旨 / ＋結論 / 全部。ListenDepth の深さ番号(4/3/2/1)に対応する。
+ *   題名 = 題名だけ(4)  要旨 = 題名＋要旨(3)  ＋結論 = 要旨＋結論(2)  全部 = 結論＋主なポイントまで(1)
+ *
+ * 古いiOS Safariで構文エラーになる記法(アロー関数・let/const・?.・??・replaceAll・後読み)は使わない。
+ */
+(function (root, factory) {
+  var api = factory();
+  if (typeof module === "object" && module && module.exports) module.exports = api;
+  else root.YMListen = api;
+})(typeof self !== "undefined" ? self : this, function () {
+  "use strict";
+
+  // UIの並び順(浅い→深い)。depth は ListenDepth の深さ番号。
+  var DEPTHS = [
+    { key: "title", name: "題名", depth: 4 },
+    { key: "summary", name: "要旨", depth: 3 },
+    { key: "conclusion", name: "＋結論", depth: 2 },
+    { key: "all", name: "全部", depth: 1 }
+  ];
+
+  // 読み上げの速さの見積もり: 1倍速で毎秒6.5文字(仮の値。実機で測って直す)。部分の切れ目ごとに約0.7秒の間。
+  var CHARS_PER_SEC = 6.5;
+  var PART_PAUSE_SEC = 0.7;
+  var LIMIT_SEC = 15 * 60;
+
+  function byDepth(depth) {
+    for (var i = 0; i < DEPTHS.length; i++) if (DEPTHS[i].depth === depth) return DEPTHS[i];
+    return DEPTHS[1];
+  }
+  function byKey(key) {
+    for (var i = 0; i < DEPTHS.length; i++) if (DEPTHS[i].key === key) return DEPTHS[i];
+    return null;
+  }
+
+  function stripHtml(s) {
+    return String(s || "").replace(/<[^>]*>/g, " ").replace(/&nbsp;/g, " ").replace(/&amp;/g, "&")
+      .replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&quot;/g, "\"").replace(/&#39;/g, "'")
+      .replace(/\s+/g, " ").replace(/^\s+|\s+$/g, "");
+  }
+
+  // 深さ(4/3/2/1)ごとに読む部分の一覧。[{part, text}]。無い部分は入れない。
+  function parts(item, depth, pos) {
+    item = item || {};
+    var out = [];
+    var title = stripHtml(item.title);
+    out.push({ part: "title", text: (pos ? pos + "番。 " : "") + title });
+    if (depth <= 3 && item.summary) out.push({ part: "summary", text: stripHtml(item.summary) });
+    if (depth <= 2 && item.conclusion) out.push({ part: "conclusion", text: "結論。 " + stripHtml(item.conclusion) });
+    if (depth <= 1 && item.points) {
+      var pt = stripHtml(item.points);
+      if (pt) out.push({ part: "points", text: "主なポイント。 " + pt });
+    }
+    return out;
+  }
+
+  function estimateSec(item, depth, rate) {
+    var ps = parts(item, depth, 0), n = 0;
+    for (var i = 0; i < ps.length; i++) n += ps[i].text.length;
+    var r = (typeof rate === "number" && rate > 0) ? rate : 1;
+    return n / (CHARS_PER_SEC * r) + ps.length * PART_PAUSE_SEC;
+  }
+
+  function minutesLabel(sec) {
+    var m = Math.max(1, Math.ceil(sec / 60));
+    return "約" + m + "分";
+  }
+
+  // 深さ自動。ListenDepth.decide と同じ材料を、カードとサマリーから集める。
+  // 戻り値 {depth, key, name, why}。ListenDepth が無い・失敗したときは要旨。
+  function autoDepth(listenDepth, item, category) {
+    item = item || {};
+    var d = null;
+    try {
+      d = listenDepth.decide({
+        category: category || "", type: item.type, duration: item.duration,
+        aiScore: (item.ai && typeof item.ai.s === "number") ? item.ai.s : null,
+        rssJudge: (typeof item.rss_judge === "number") ? item.rss_judge : null,
+        starred: item.is_favorite === true || item.category === "Followed Note"
+      });
+    } catch (e) { d = null; }
+    var depth = d ? d.depth : 3;
+    var b = byDepth(depth);
+    return { depth: depth, key: b.key, name: b.name, why: d ? d.why : "材料なし(標準)" };
+  }
+
+  function isStarred(item) {
+    return !!item && (item.is_favorite === true || item.category === "Followed Note");
+  }
+
+  // サマリーの新しさ: ファイル名の _YYYYMMDD_HHMMSS。無ければ0。
+  function fileStamp(filename) {
+    var m = /_(\d{8})_(\d{6})/.exec(filename || "");
+    return m ? Number(m[1] + m[2]) : 0;
+  }
+
+  function scoreOf(item) {
+    return (item && item.ai && typeof item.ai.s === "number") ? item.ai.s : 0;
+  }
+
+  // 読む順。order: "score"(点数の高い順・★は先頭・サマリーをまたぐ) | "newest"(サマリーごと・新しい順) | "oldest"(古い順)
+  // cards: [{filename, iIdx, item, key, category}]。元の配列は変えない。
+  function sortCards(cards, order) {
+    var arr = [], i;
+    for (i = 0; i < cards.length; i++) arr.push({ c: cards[i], n: i });
+    arr.sort(function (a, b) {
+      var x = a.c, y = b.c, d;
+      if (order === "score") {
+        d = (isStarred(y.item) ? 1 : 0) - (isStarred(x.item) ? 1 : 0);
+        if (d) return d;
+        d = scoreOf(y.item) - scoreOf(x.item);
+        if (d) return d;
+        d = fileStamp(y.filename) - fileStamp(x.filename);
+        if (d) return d;
+      } else {
+        d = fileStamp(y.filename) - fileStamp(x.filename);
+        if (order === "oldest") d = -d;
+        if (d) return d;
+        if (x.filename !== y.filename) return x.filename < y.filename ? -1 : 1;
+      }
+      d = x.iIdx - y.iIdx;
+      return d || (a.n - b.n);
+    });
+    var out = [];
+    for (i = 0; i < arr.length; i++) out.push(arr[i].c);
+    return out;
+  }
+
+  // 聴く計画。
+  // opts: {order, limitSec, rate, listenDepth, isRead(card)->bool, checkedFiles{filename:bool}, skipKeys{key:true}}
+  // 戻り値: {session:[{card, depth, key, name, why, sec}], sec, total, rest}
+  //   session = 今回の15分ぶん(最低1件)。total = 対象の未読の件数。rest = 今回に入らなかった件数。
+  function plan(cards, opts) {
+    opts = opts || {};
+    var limit = typeof opts.limitSec === "number" ? opts.limitSec : LIMIT_SEC;
+    var checked = opts.checkedFiles || {};
+    var skip = opts.skipKeys || {};
+    var pool = [], i;
+    for (i = 0; i < cards.length; i++) {
+      var c = cards[i];
+      if (!c || !c.item || c.item.is_error) continue;
+      if (checked[c.filename] === false) continue;
+      if (skip[c.key]) continue;
+      if (opts.isRead && opts.isRead(c)) continue;
+      pool.push(c);
+    }
+    var ordered = sortCards(pool, opts.order || "score");
+    var session = [], sec = 0;
+    for (i = 0; i < ordered.length; i++) {
+      var a = autoDepth(opts.listenDepth, ordered[i].item, ordered[i].category);
+      var s = estimateSec(ordered[i].item, a.depth, opts.rate);
+      if (session.length > 0 && sec + s > limit) break;
+      session.push({ card: ordered[i], depth: a.depth, key: a.key, name: a.name, why: a.why, sec: s });
+      sec += s;
+    }
+    return { session: session, sec: sec, total: ordered.length, rest: ordered.length - session.length };
+  }
+
+  return {
+    DEPTHS: DEPTHS, LIMIT_SEC: LIMIT_SEC, CHARS_PER_SEC: CHARS_PER_SEC,
+    byDepth: byDepth, byKey: byKey, stripHtml: stripHtml, parts: parts, estimateSec: estimateSec,
+    minutesLabel: minutesLabel, autoDepth: autoDepth, sortCards: sortCards, plan: plan, fileStamp: fileStamp
+  };
+});
+</script>
+<script>/*
+ * beta_ui.js - 新UI(beta.html)の部品。依存なし・独立(beta.html に埋め込む / node でテストする)。
+ *
+ * 1-1: beta.html は薄い殻。同じオリジンの index.html を fetch し、
+ *      「// YM_BETA_DATA_BEGIN」〜「// YM_BETA_DATA_END」の間(ALL_DATA と DASHBOARD_DATA の宣言)だけ取り出して使う。
+ * 1-2: 既読はカードのURLキー(動画idまたはURL)で覚える。保存先は localStorage の summaryManagerReadV2。
+ *      旧UIの summaryManagerState.readHistory(`${filename}_${iIdx}`)は読むだけで、書き換えない(旧→新の一方向)。
+ *
+ * 古いiOS Safariで構文エラーになる記法(アロー関数・let/const・?.・??・replaceAll・後読み)は使わない。
+ */
+(function (root, factory) {
+  var api = factory();
+  if (typeof module === "object" && module && module.exports) module.exports = api;
+  else root.YMBeta = api;
+})(typeof self !== "undefined" ? self : this, function () {
+  "use strict";
+
+  var READ_V2_KEY = "summaryManagerReadV2";
+  var OLD_STATE_KEY = "summaryManagerState";
+  var DATA_BEGIN = "// YM_BETA_DATA_BEGIN";
+  var DATA_END = "// YM_BETA_DATA_END";
+
+  // Python側 summary_analysis.video_id_of と同じ: URLの ?v= の値。無ければURLそのもの。
+  function videoIdOf(url) {
+    var m = /[?&]v=([^&#]*)/.exec(url || "");
+    return m ? decodeURIComponent(m[1]) : "";
+  }
+
+  // カードの身元キー。urlがあれば 動画id か URL、無ければ位置で代用(p:ファイル名_位置)。
+  function cardKey(item, filename, iIdx) {
+    var u = (item && item.url) || "";
+    if (u) return videoIdOf(u) || u;
+    return "p:" + filename + "_" + iIdx;
+  }
+
+  function isObj(x) { return x && typeof x === "object"; }
+
+  // 旧readHistoryのキー `ファイル名_位置` → [ファイル名, 位置]。ファイル名は下線を含むので最後の下線で切る。
+  function splitOldKey(k) {
+    var p = k.lastIndexOf("_");
+    if (p <= 0) return null;
+    var idx = Number(k.slice(p + 1));
+    if (!isFinite(idx) || Math.floor(idx) !== idx || idx < 0) return null;
+    return [k.slice(0, p), idx];
+  }
+
+  function findFile(allData, filename) {
+    for (var i = 0; i < allData.length; i++) if (allData[i] && allData[i].filename === filename) return allData[i];
+    return null;
+  }
+
+  // 旧の既読(readHistory)をV2へ追加する。read は {キー: 時刻} で、渡したものを変更せず新しいものを返す。
+  // 戻り値 {read, added, unresolved}。unresolved は現在のALL_DATAに存在しないカード(古いサマリーが消えた等)の件数。
+  function migrateOld(readV2, readHistory, allData, now) {
+    var out = {}, k, added = 0, unresolved = 0;
+    for (k in (readV2 || {})) if (Object.prototype.hasOwnProperty.call(readV2, k)) out[k] = readV2[k];
+    for (k in (readHistory || {})) {
+      if (!Object.prototype.hasOwnProperty.call(readHistory, k) || !readHistory[k]) continue;
+      var sp = splitOldKey(k);
+      var f = sp && findFile(allData || [], sp[0]);
+      var item = f && f.items && f.items[sp[1]];
+      if (!item) { unresolved++; continue; }
+      var key = cardKey(item, sp[0], sp[1]);
+      if (!out[key]) { out[key] = now || 1; added++; }
+    }
+    return { read: out, added: added, unresolved: unresolved };
+  }
+
+  function isRead(readV2, item, filename, iIdx) {
+    return !!(readV2 && readV2[cardKey(item, filename, iIdx)]);
+  }
+
+  // 書き出し v2: {"v":2,"read":[キー,...]}
+  function buildExport(readV2) {
+    var keys = [];
+    for (var k in (readV2 || {})) if (Object.prototype.hasOwnProperty.call(readV2, k) && readV2[k]) keys.push(k);
+    return JSON.stringify({ v: 2, read: keys });
+  }
+
+  // 取り込み。v1({"v":1,"read":{ファイル名:[位置]}})とv2の両方を受ける。追加のみ。
+  // 戻り値 {read, added, unresolved} か、形式が不正なら null。
+  function importRead(readV2, text, allData, now) {
+    var obj;
+    try { obj = JSON.parse(String(text).trim()); } catch (e) { return null; }
+    if (!isObj(obj) || !obj.read) return null;
+    var out = {}, k, added = 0, unresolved = 0;
+    for (k in (readV2 || {})) if (Object.prototype.hasOwnProperty.call(readV2, k)) out[k] = readV2[k];
+    if (obj.v === 2 && Object.prototype.toString.call(obj.read) === "[object Array]") {
+      for (var i = 0; i < obj.read.length; i++) {
+        var key = obj.read[i];
+        if (typeof key !== "string" || !key) continue;
+        if (!out[key]) { out[key] = now || 1; added++; }
+      }
+      return { read: out, added: added, unresolved: 0 };
+    }
+    if (isObj(obj.read) && Object.prototype.toString.call(obj.read) !== "[object Array]") {
+      var old = {};
+      for (var fn in obj.read) {
+        if (!Object.prototype.hasOwnProperty.call(obj.read, fn)) continue;
+        var idxs = obj.read[fn];
+        if (Object.prototype.toString.call(idxs) !== "[object Array]") continue;
+        for (var j = 0; j < idxs.length; j++) old[fn + "_" + idxs[j]] = true;
+      }
+      var m = migrateOld(out, old, allData, now);
+      return m;
+    }
+    return null;
+  }
+
+  // index.html の本文から ALL_DATA / DASHBOARD_DATA を取り出す。目印が無ければ null。
+  function extractData(html) {
+    var a = html.indexOf(DATA_BEGIN);
+    var b = html.indexOf(DATA_END);
+    if (a < 0 || b < 0 || b <= a) return null;
+    var body = html.slice(a + DATA_BEGIN.length, b);
+    try {
+      return (new Function(body + "\n;return {ALL_DATA: ALL_DATA, DASHBOARD_DATA: DASHBOARD_DATA};"))();
+    } catch (e) {
+      return null;
+    }
+  }
+
+  // ---- ブラウザ側の起動(node のテストでは動かない) ----
+  function lsGet(key) { try { return localStorage.getItem(key); } catch (e) { return null; } }
+  function lsSet(key, val) { try { localStorage.setItem(key, val); return true; } catch (e) { return false; } }
+
+  function loadReadV2() {
+    var s = lsGet(READ_V2_KEY), o = null;
+    try { o = s ? JSON.parse(s) : null; } catch (e) { o = null; }
+    return (o && o.v === 2 && isObj(o.read)) ? o.read : {};
+  }
+  function saveReadV2(read) { return lsSet(READ_V2_KEY, JSON.stringify({ v: 2, read: read })); }
+
+  function loadOldHistory() {
+    var s = lsGet(OLD_STATE_KEY), o = null;
+    try { o = s ? JSON.parse(s) : null; } catch (e) { o = null; }
+    return (o && isObj(o.readHistory)) ? o.readHistory : {};
+  }
+
+  function boot(doc) {
+    var out = doc.getElementById("ym-status");
+    function say(t) { out.textContent = t; }
+    say("index.html を読み込み中…");
+    fetch("index.html", { cache: "no-cache" }).then(function (r) {
+      if (!r.ok) throw new Error("HTTP " + r.status);
+      return r.text();
+    }).then(function (html) {
+      var d = extractData(html);
+      if (!d) { say("index.html にデータの目印がありません。公開バッチを一度実行してください。"); return; }
+      var m = migrateOld(loadReadV2(), loadOldHistory(), d.ALL_DATA, Date.now());
+      var saved = saveReadV2(m.read);
+      var total = 0, unread = 0, cards = [];
+      for (var i = 0; i < d.ALL_DATA.length; i++) {
+        var f = d.ALL_DATA[i], items = f.items || [];
+        for (var j = 0; j < items.length; j++) {
+          if (items[j].is_error) continue;
+          total++;
+          cards.push({ filename: f.filename, iIdx: j, item: items[j], key: cardKey(items[j], f.filename, j), category: f.category });
+          if (!isRead(m.read, items[j], f.filename, j)) unread++;
+        }
+      }
+      var nRead = 0, k;
+      for (k in m.read) if (Object.prototype.hasOwnProperty.call(m.read, k)) nRead++;
+      var lines = ["サマリー " + d.ALL_DATA.length + "枚 / カード " + total + "件 / 未読 " + unread + "件",
+        "既読(V2) " + nRead + "件(今回の移行で +" + m.added + "、対応先なし " + m.unresolved + ")"];
+      if (typeof YMListen !== "undefined" && typeof ListenDepth !== "undefined") {
+        var pl = YMListen.plan(cards, {
+          order: "score", listenDepth: ListenDepth, rate: 2,
+          isRead: function (c) { return isRead(m.read, c.item, c.filename, c.iIdx); }
+        });
+        var cnt = {}, q;
+        for (q = 0; q < pl.session.length; q++) cnt[pl.session[q].name] = (cnt[pl.session[q].name] || 0) + 1;
+        var parts = [];
+        for (k in cnt) if (Object.prototype.hasOwnProperty.call(cnt, k)) parts.push(k + " " + cnt[k]);
+        lines.push("▶ 聴く " + pl.session.length + "件・" + YMListen.minutesLabel(pl.sec) + "(2倍速の見積もり。点数の高い順・15分で区切り)");
+        lines.push("深さ: " + parts.join(" / ") + "　残り " + pl.rest + "件");
+      }
+      if (!saved) lines.push("※既読を保存できませんでした(ブラウザの保存制限)");
+      say(lines.join("\n"));
+    }).catch(function (e) {
+      say("読み込みに失敗しました: " + e);
+    });
+  }
+
+  var api = {
+    READ_V2_KEY: READ_V2_KEY,
+    videoIdOf: videoIdOf,
+    cardKey: cardKey,
+    migrateOld: migrateOld,
+    isRead: isRead,
+    buildExport: buildExport,
+    importRead: importRead,
+    extractData: extractData,
+    boot: boot
+  };
+  return api;
+});
+</script>
+<script>YMBeta.boot(document);</script>
+</body></html>
