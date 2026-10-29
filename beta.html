@@ -1757,18 +1757,29 @@
     ".ym .big:disabled{background:#a0aec0}",
     ".ym .chip{font-size:.95rem;padding:8px 12px;border-radius:999px;border:1px solid #cbd5e0;background:#fff;color:#2d3748}",
     ".ym .chip.on{background:#3b6ab0;color:#fff;border-color:#3b6ab0}",
-    ".ym .card{background:#fff;border:2px solid #e2e8f0;border-radius:14px;padding:14px;margin:8px 0;min-height:140px}",
+    ".ym .card{background:#fff;border:2px solid #e2e8f0;border-radius:14px;padding:14px;margin:8px 0;height:38vh;min-height:220px;overflow-y:auto;-webkit-overflow-scrolling:touch}",
     ".ym .card.star{background:#fffbeb;border-color:#d4a017}",
     ".ym .card h2{font-size:1.1rem;margin:0 0 8px;line-height:1.4}",
     ".ym .plab{font-size:.8rem;color:#718096;margin-bottom:4px}",
     ".ym .ptext{font-size:1rem;line-height:1.7;background:#fef9c3;border-radius:8px;padding:8px}",
-    ".ym .meta{display:flex;justify-content:space-between;font-size:.9rem;color:#4a5568;margin:4px 0}",
+    ".ym .meta{display:flex;justify-content:space-between;font-size:.9rem;color:#4a5568;margin:4px 0;gap:8px;height:1.4em;white-space:nowrap;overflow:hidden}",
+    ".ym .meta span:last-child{overflow:hidden;text-overflow:ellipsis}",
     ".ym .wide{display:flex;gap:8px;margin:8px 0}",
     ".ym .wide button{flex:1;height:72px;font-size:1.1rem;font-weight:bold;border-radius:14px;border:2px solid #2c5282;background:#fff;color:#1a365d}",
     ".ym .wide button.sel{background:#bee3f8}",
     ".ym .wide button.main{background:#3b6ab0;color:#fff}",
     ".ym .links{display:flex;gap:8px;margin:8px 0}",
     ".ym .links a,.ym .links button{flex:1;text-align:center;font-size:.95rem;padding:12px 4px;border-radius:10px;border:1px solid #cbd5e0;background:#fff;color:#2d3748;text-decoration:none}",
+    ".ym .dock{position:fixed;left:0;right:0;bottom:0;background:#f7fafc;border-top:1px solid #e2e8f0;padding:0 16px calc(8px + env(safe-area-inset-bottom));z-index:30}",
+    ".ym .dock-in{max-width:640px;margin:0 auto}",
+    ".ym.listening{padding-bottom:300px}.ym.listening .toast{bottom:calc(290px + env(safe-area-inset-bottom))}",
+    ".ym .dinp{display:block;width:100%;box-sizing:border-box;font-size:1rem;padding:10px;margin:8px 0;border:1px solid #cbd5e0;border-radius:8px}",
+    ".ym .dnote{font-size:.85rem;color:#718096;margin:4px 0}.ym .dlab{font-size:.8rem;color:#3b6ab0;margin-top:6px}",
+    ".ym .dtext{font-size:1rem;line-height:1.6;background:#f1f5f9;border-radius:8px;padding:8px;-webkit-user-select:text;user-select:text}",
+    ".ym .dmsg{font-size:.9rem;color:#2f855a;min-height:1.4em;margin:6px 0}.ym .dmsg.warn{color:#c53030}",
+    ".ym .ditem{display:flex;align-items:center;gap:8px;padding:6px 0;border-bottom:1px solid #edf2f7}",
+    ".ym .dw{font-weight:bold}.ym .dr{flex:1;color:#4a5568}.ym .dtag{font-size:.75rem;color:#718096}",
+    ".ym .dx{font-size:1.1rem;padding:6px 12px;border-radius:8px;border:1px solid #cbd5e0;background:#fff}",
     ".ym .toast{position:fixed;left:12px;right:12px;bottom:calc(12px + env(safe-area-inset-bottom));background:#2d3748;color:#fff;border-radius:10px;padding:10px 12px;font-size:.9rem;display:none;z-index:50}",
     ".ym .toast.show{display:block}.ym .toast.warn{background:#c53030}",
     ".ym .sheet{position:fixed;left:0;right:0;bottom:0;top:12%;background:#fff;border-radius:16px 16px 0 0;box-shadow:0 -4px 20px rgba(0,0,0,.25);padding:14px;overflow:auto;z-index:40;display:none}",
@@ -1885,6 +1896,14 @@
       }
     } catch (e) { ctx.thumbClient = null; }
     try { if (W.TtsUserDict) ctx.dictStore = W.TtsUserDict.createStore({ storage: W.localStorage, device: IS_IOS ? "iPhone" : "PC" }); } catch (e) { ctx.dictStore = null; }
+    try {
+      if (W.YtLabels && W.YM_LABELS_CONFIG && W.YtLabels.createTtsDictClient) {
+        ctx.dictClient = W.YtLabels.createTtsDictClient({
+          url: W.YM_LABELS_CONFIG.url, anonKey: W.YM_LABELS_CONFIG.anonKey, storage: null,
+          getKey: function () { return lsGet("ytLabelKey") || ""; }
+        });
+      }
+    } catch (e) { ctx.dictClient = null; }
     return ctx;
   }
 
@@ -1938,6 +1957,7 @@
   function renderHome(ctx) {
     var doc = ctx.doc, root = ctx.root, m = ctx.migrated, i;
     root.innerHTML = "";
+    root.className = "ym";
     var plan = makePlan(ctx);
     root.appendChild(el(doc, "h1", "", "YouTubeサマリー beta"));
     var lines = ["サマリー " + ctx.data.ALL_DATA.length + "枚 / カード " + ctx.cards.length + "件 / 未読 " + unreadCount(ctx) + "件",
@@ -2010,6 +2030,7 @@
     if (!e) return;
     var it = e.card.item, doc = ctx.doc, sh = ctx.sheet;
     sh.innerHTML = "";
+    sh.setAttribute("data-mode", "full");
     var close = el(doc, "button", "close", "閉じる");
     close.addEventListener("click", function () { sh.className = "sheet"; });
     sh.appendChild(close);
@@ -2023,9 +2044,136 @@
     sh.className = "sheet show";
   }
 
+  // ---- 読み方の登録(旧UIと同じ辞書: 端末に保存し、共有の辞書にも送る) ----
+  function openDict(ctx) {
+    var store = ctx.dictStore, doc = ctx.doc, sh = ctx.sheet, i;
+    if (!store || !W.TtsUserDict) { toast(ctx, "読み方の部品を読み込めませんでした", true); return; }
+    if (ctx.player) ctx.player.pause();      // 登録中は読み上げを止める(続きは再生ボタンで)
+    sh.innerHTML = "";
+    sh.setAttribute("data-mode", "dict");
+    var close = el(doc, "button", "close", "閉じる");
+    close.addEventListener("click", function () { sh.className = "sheet"; sh.setAttribute("data-mode", ""); });
+    sh.appendChild(close);
+    sh.appendChild(el(doc, "h2", "", "読み方を登録"));
+
+    sh.appendChild(el(doc, "h3", "", "直前に読み上げた文"));
+    var histBox = el(doc, "div", "dhist");
+    var names = ["いま", "1つ前", "2つ前"];
+    if (!ctx.hist.length) histBox.appendChild(el(doc, "div", "dnote", "まだ読み上げていません。言葉は手で入力できます。"));
+    for (i = 0; i < ctx.hist.length; i++) {
+      histBox.appendChild(el(doc, "div", "dlab", names[i]));
+      histBox.appendChild(el(doc, "div", "dtext", ctx.hist[i]));
+    }
+    sh.appendChild(histBox);
+    sh.appendChild(el(doc, "div", "dnote", "上の文の中の言葉を長押しで選ぶと、「言葉」の欄に入ります。"));
+
+    var word = el(doc, "input", "dinp"); word.type = "text"; word.placeholder = "言葉(例: Claude)"; word.setAttribute("autocomplete", "off");
+    var reading = el(doc, "input", "dinp"); reading.type = "text"; reading.placeholder = "正しい読み(例: クロード)"; reading.setAttribute("autocomplete", "off");
+    sh.appendChild(word); sh.appendChild(reading);
+    var msg = el(doc, "div", "dmsg");
+    function say(t, warn) { msg.textContent = t || ""; msg.className = "dmsg" + (warn ? " warn" : ""); }
+
+    var row = el(doc, "div", "links");
+    var test = el(doc, "button", "", "▶ 試し読み"), add = el(doc, "button", "", "＋ 登録");
+    row.appendChild(test); row.appendChild(add);
+    sh.appendChild(row); sh.appendChild(msg);
+
+    var listHead = el(doc, "h3", ""), list = el(doc, "div", "dlist");
+    sh.appendChild(listHead); sh.appendChild(list);
+
+    function renderList() {
+      var items = store.entries(), k;
+      list.innerHTML = "";
+      listHead.textContent = "登録した言葉(" + items.length + ")";
+      if (!items.length) list.appendChild(el(doc, "div", "dnote", "まだ登録がありません。"));
+      function mkRow(e) {
+        var r = el(doc, "div", "ditem");
+        r.appendChild(el(doc, "span", "dw", e.w)); r.appendChild(el(doc, "span", "dr", e.r));
+        r.appendChild(el(doc, "span", "dtag", e.status === "local" ? "端末のみ" : "共有"));
+        var x = el(doc, "button", "dx", "×"); x.setAttribute("aria-label", e.w + "を削除");
+        x.addEventListener("click", function () {
+          if (!W.confirm("「" + e.w + "」の登録を削除しますか")) return;
+          store.remove(e.w); say("削除しました。"); renderList(); sync();
+        });
+        r.appendChild(x);
+        return r;
+      }
+      for (k = 0; k < items.length; k++) list.appendChild(mkRow(items[k]));
+    }
+
+    function sync() {
+      return store.sync(ctx.dictClient).then(function (r) {
+        renderList();
+        if (r && ctx.dictClient) {
+          if (r.denied) say("合言葉が合わないか、1日の上限に達したため、共有に送れませんでした(端末には保存されています)", true);
+          else if (r.rejected > 0) say(r.rejected + "件は共有に受け付けられませんでした(端末には保存されています)", true);
+          else if (r.failed > 0) say("通信できないため、共有には送れていません。次に開いたときに再送します(端末には保存されています)", true);
+          else if (r.sent > 0) say("共有の辞書にも送信しました(他の端末にも反映されます)");
+        }
+      }, function () { });
+    }
+
+    add.addEventListener("click", function () {
+      var res = store.add(word.value, reading.value);
+      if (!res.ok) { say(res.error, true); return; }
+      word.value = ""; reading.value = "";
+      say("登録しました。次の読み上げから効きます。");
+      renderList();
+      if (ctx.dictClient && !lsGet("ytLabelKey") && !ctx.dictAsked) {      // 共有に送るための合言葉(👎👍と同じもの)
+        ctx.dictAsked = true;
+        var v = String(W.prompt("共有の辞書に送るための合言葉を入力してください(初回だけ)", "") || "").trim();
+        if (v) lsSet("ytLabelKey", v);
+      }
+      sync();
+    });
+
+    // 試し読み: 直前に読んだ文のうち、その言葉を含む1文を、その読みで聞く(無ければ言葉そのもの)
+    test.addEventListener("click", function () {
+      var w = word.value.replace(/^\s+|\s+$/g, ""), r = reading.value.replace(/^\s+|\s+$/g, "");
+      var err = W.TtsUserDict.validate(w, r);
+      if (err) { say(err, true); return; }
+      var base = ctx.hist.length ? ctx.hist[0] : w, h, seg, ps, p;
+      for (h = 0; h < ctx.hist.length; h++) if (ctx.hist[h].indexOf(w) >= 0) { base = ctx.hist[h]; break; }
+      seg = base; ps = base.split("。");
+      for (p = 0; p < ps.length; p++) if (ps[p].indexOf(w) >= 0) { seg = ps[p]; break; }
+      if (seg.length > 120) { var at = Math.max(0, seg.indexOf(w) - 40); seg = seg.slice(at, at + 120); }
+      var extra = {}, cur = store.dict(), k;
+      for (k in cur) if (Object.prototype.hasOwnProperty.call(cur, k)) extra[k] = cur[k];
+      extra[w] = r;
+      var txt = seg;
+      if (W.TTSClean) { try { txt = W.TTSClean.clean(seg, { extraDict: extra }) || seg; } catch (e) { txt = seg; } }
+      try {
+        W.speechSynthesis.cancel();
+        var ut = new W.SpeechSynthesisUtterance(txt);
+        ut.rate = ctx.rate; pickVoice(ut);
+        W.speechSynthesis.speak(ut);
+        say("試し読み: " + (txt.length > 40 ? txt.slice(0, 40) + "…" : txt));
+      } catch (e) { say("試し読みできませんでした。", true); }
+    });
+
+    if (!ctx.dictSelBound) {
+      ctx.dictSelBound = true;
+      doc.addEventListener("selectionchange", function () {
+        if (sh.getAttribute("data-mode") !== "dict" || !sh.classList.contains("show")) return;
+        var sel = W.getSelection ? W.getSelection() : null;
+        if (!sel || sel.isCollapsed || !sel.anchorNode) return;
+        var wi = sh.querySelector("input.dinp"), hb = sh.querySelector(".dhist");
+        if (!wi || !hb || !hb.contains(sel.anchorNode)) return;
+        var t = sel.toString().replace(/^\s+|\s+$/g, "");
+        if (t && t.length <= 40) wi.value = t;
+      });
+    }
+
+    renderList();
+    sh.className = "sheet show";
+    sh.scrollTop = 0;
+    sync();
+  }
+
   function renderListen(ctx, plan) {
     var doc = ctx.doc, root = ctx.root, ui = {};
     root.innerHTML = "";
+    root.className = "ym listening";
     ctx.ui = ui;
     ui.head = el(doc, "div", "meta");
     ui.pos = el(doc, "span"); ui.dname = el(doc, "span");
@@ -2049,12 +2197,21 @@
     ui.card.appendChild(ui.title); ui.card.appendChild(ui.plab); ui.card.appendChild(ui.ptext);
     root.appendChild(ui.card);
 
+    var home = el(doc, "div", "links");
+    var hb = el(doc, "button", "", "ホームへ戻る");
+    hb.addEventListener("click", function () { leaveListen(ctx); });
+    home.appendChild(hb);
+    root.appendChild(home);
+
+    // 操作のボタンは画面の下に固定する。カードの文の長さが変わっても、ボタンは動かない。
+    var dock = el(doc, "div", "dock"), dockIn = el(doc, "div", "dock-in");
+    dock.appendChild(dockIn);
     var th = el(doc, "div", "wide");
     ui.down = el(doc, "button", "", "👎 よくない"); ui.up = el(doc, "button", "", "👍 いいね");
     ui.down.addEventListener("click", function () { thumbPress(ctx, "down"); });
     ui.up.addEventListener("click", function () { thumbPress(ctx, "up"); });
     th.appendChild(ui.down); th.appendChild(ui.up);
-    root.appendChild(th);
+    dockIn.appendChild(th);
 
     var nav = el(doc, "div", "wide");
     var prev = el(doc, "button", "", "⏮ 前"); ui.play = el(doc, "button", "main", "⏸ 停止"); var next = el(doc, "button", "", "次 ⏭");
@@ -2062,7 +2219,7 @@
     next.addEventListener("click", function () { ctx.player.next(); });
     ui.play.addEventListener("click", function () { if (ctx.player.state().playing) ctx.player.pause(); else ctx.player.play(); });
     nav.appendChild(prev); nav.appendChild(ui.play); nav.appendChild(next);
-    root.appendChild(nav);
+    dockIn.appendChild(nav);
 
     var links = el(doc, "div", "links");
     var full = el(doc, "button", "", "📄 全文");
@@ -2070,15 +2227,10 @@
     ui.src = el(doc, "a", "", "🔗 元の記事"); ui.src.target = "_blank"; ui.src.rel = "noopener";
     ui.src.addEventListener("click", function () { ctx.player.pause(); });      // 元の記事を開くときは読み上げを止める
     var rd = el(doc, "button", "", "🗣 読み方");
-    rd.addEventListener("click", function () { toast(ctx, "読み方の登録は、次の更新で入ります", false); });
+    rd.addEventListener("click", function () { openDict(ctx); });
     links.appendChild(full); links.appendChild(ui.src); links.appendChild(rd);
-    root.appendChild(links);
-
-    var home = el(doc, "div", "links");
-    var hb = el(doc, "button", "", "ホームへ戻る");
-    hb.addEventListener("click", function () { leaveListen(ctx); });
-    home.appendChild(hb);
-    root.appendChild(home);
+    dockIn.appendChild(links);
+    root.appendChild(dock);
 
     ctx.sheet = el(doc, "div", "sheet"); root.appendChild(ctx.sheet);
     ctx.toastEl = el(doc, "div", "toast"); root.appendChild(ctx.toastEl);
@@ -2108,6 +2260,7 @@
   function renderEnd(ctx) {
     var doc = ctx.doc, root = ctx.root;
     root.innerHTML = "";
+    root.className = "ym";
     root.appendChild(el(doc, "h1", "", "ここまで聴きました"));
     var plan = makePlan(ctx);
     root.appendChild(el(doc, "pre", "", "この回で既読にしたカード: " + ctx.sessionRead + "件\n残りの未読: " + plan.total + "件"));
