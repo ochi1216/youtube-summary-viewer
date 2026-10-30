@@ -1,0 +1,3062 @@
+<!DOCTYPE html>
+<html lang="ja"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover"><title>YouTubeサマリー V2</title></head>
+<body><div id="ym-root"></div>
+<script>var YM_LABELS_CONFIG = {"url": "https://bpdkdwtevqsqgsxlahmd.supabase.co", "anonKey": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImJwZGtkd3RldnFzcWdzeGxhaG1kIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODI1NjAzOTcsImV4cCI6MjA5ODEzNjM5N30.zfxxhgVCmZAGrk2LiSnPpEHg72mjdJne3c6YOXBeCTs"};</script>
+<script>/*
+ * listen_depth.js - 聴くモードの「読む深さ」の決め打ち。依存なし・独立(統合HTMLに埋め込む / node でテストする)。
+ *
+ * 深さ(4段階。数字が小さいほど深い):
+ *   1 = ▶    主なポイントこみ
+ *   2 = ▶▶＋  結論まで(要旨→結論)。▶▶ より長く、▶ より短い
+ *   3 = ▶▶   要旨こみ
+ *   4 = ▶▶▶  タイトルのみ
+ * 入力 (item) :
+ *   category   ファイルのカテゴリ(V S A B M N Short BBT PODCAST RSS)。大文字小文字は問わない
+ *   type       'youtube' | 'podcast' | 'rss'(categoryが不明なときの代用)
+ *   duration   動画時間の文字列("27:35" "1:02:45")。YouTubeの①長さ
+ *   aiScore    AI分析の1〜5(②テーマ)
+ *   rssJudge   RSSの判定0〜100点(③。AI分析の1〜5とは別の指標)
+ *   starred    ゴールドカード(★。YouTubeのお気に入り / RSSのFollowed Note)
+ *
+ * ルール(越智さん指定 2026-10-10):
+ *   ① 長さ(既存のインジケーター🟩の数 = 0〜5。≦3分=0 / ≦15分=1 / ≦30分=2 / ≦45分=3 / ≦60分=4 / それ以上=5)
+ *        5→▶  4→▶▶＋  3→▶▶  2→▶▶▶  1→▶▶▶  0→▶▶▶
+ *   ② AI分析   5→▶  4→▶▶＋  3→▶▶  2→▶▶▶  1→▶▶▶
+ *   ③ RSS判定  ≧90→▶  ≧80→▶▶＋  ≧70→▶▶  ≧60→▶▶▶  ≦59→▶▶▶
+ *   ★付き: ①②③にかかわらず、少なくとも▶▶＋(高い方=深い方を採る。▶になるものは▶のまま)
+ *   Podcast・BBT は常に▶。N・Short は常に▶▶▶(★があっても)。RSSは②③★の深い方。V S A B M は①②★の深い方。
+ *   材料が1つも無いカード(分析が間に合っていない等)は▶▶。1つだけ有るときはその材料で決める。
+ *
+ * 古いiOS Safariで構文エラーになる記法(アロー関数・let/const・?.・??・replaceAll・後読み)は使わない。
+ */
+(function (root, factory) {
+  var api = factory();
+  if (typeof module === "object" && module && module.exports) module.exports = api;
+  else root.ListenDepth = api;
+})(typeof self !== "undefined" ? self : this, function () {
+  "use strict";
+
+  var POINTS = 1, CONCLUSION = 2, SUMMARY = 3, TITLE = 4;
+  var LABELS = { 1: "▶", 2: "▶▶＋", 3: "▶▶", 4: "▶▶▶" };
+  var NAMES = { 1: "主なポイントこみ", 2: "結論まで", 3: "要旨こみ", 4: "タイトルのみ" };
+
+  /** 動画時間の文字列 → 既存インジケーターの🟩の数(0〜5)。読めなければ null。 */
+  function durationLevel(duration) {
+    if (!duration || typeof duration !== "string") return null;
+    var parts = duration.trim().split(":");
+    var nums = [];
+    for (var i = 0; i < parts.length; i++) {
+      var n = Number(parts[i]);
+      if (parts[i].trim() === "" || isNaN(n) || n < 0) return null;
+      nums.push(n);
+    }
+    var sec;
+    if (nums.length === 3) sec = nums[0] * 3600 + nums[1] * 60 + nums[2];
+    else if (nums.length === 2) sec = nums[0] * 60 + nums[1];
+    else return null;
+    var min = sec / 60;
+    if (min <= 3) return 0;
+    if (min <= 15) return 1;
+    if (min <= 30) return 2;
+    if (min <= 45) return 3;
+    if (min <= 60) return 4;
+    return 5;
+  }
+
+  function depthFromLength(level) {
+    if (level === null || level === undefined) return null;
+    if (level >= 5) return POINTS;
+    if (level >= 4) return CONCLUSION;
+    if (level >= 3) return SUMMARY;
+    return TITLE;
+  }
+
+  function depthFromTheme(score) {
+    if (typeof score !== "number" || isNaN(score)) return null;
+    if (score >= 5) return POINTS;
+    if (score >= 4) return CONCLUSION;
+    if (score >= 3) return SUMMARY;
+    return TITLE;
+  }
+
+  function depthFromJudge(judge) {
+    if (typeof judge !== "number" || isNaN(judge)) return null;
+    if (judge >= 90) return POINTS;
+    if (judge >= 80) return CONCLUSION;
+    if (judge >= 70) return SUMMARY;
+    return TITLE;
+  }
+
+  function deeper(a, b) {      // null は「材料なし」。数字が小さい方が深い
+    if (a === null) return b;
+    if (b === null) return a;
+    return Math.min(a, b);
+  }
+
+  function norm(category) {
+    return String(category || "").replace(/^\s+|\s+$/g, "").toUpperCase();
+  }
+
+  function dots(n) {
+    var s = "";
+    for (var i = 0; i < 5; i++) s += (i < n ? "●" : "○");
+    return s;
+  }
+
+  /** カードの深さを返す: { depth: 1〜4, label: "▶▶＋", name: "結論まで", why: "長さ●●●●○・分析4・★" } */
+  function decide(item) {
+    item = item || {};
+    var cat = norm(item.category);
+    var kind = String(item.type || "").toLowerCase();
+    var len = durationLevel(item.duration);
+    var theme = (typeof item.aiScore === "number") ? item.aiScore : null;
+    var judge = (typeof item.rssJudge === "number") ? item.rssJudge : null;
+    var star = item.starred === true;
+    var starDepth = star ? CONCLUSION : null;
+    var depth, why;
+
+    if (cat === "PODCAST" || cat === "BBT" || (!cat && kind === "podcast")) {
+      depth = POINTS; why = (cat === "BBT" ? "BBT" : "Podcast") + "は常に主なポイントまで";
+    } else if (cat === "N" || cat === "SHORT") {
+      depth = TITLE; why = (cat === "N" ? "N" : "Short") + "はタイトルのみ";
+    } else if (cat === "RSS" || (!cat && kind === "rss")) {
+      depth = deeper(deeper(depthFromTheme(theme), depthFromJudge(judge)), starDepth);
+      why = "分析" + (theme === null ? "なし" : theme) + "・判定" + (judge === null ? "なし" : judge) + (star ? "・★" : "");
+    } else {
+      depth = deeper(deeper(depthFromLength(len), depthFromTheme(theme)), starDepth);
+      why = "長さ" + (len === null ? "不明" : dots(len)) + "・分析" + (theme === null ? "なし" : theme) + (star ? "・★" : "");
+    }
+    if (depth === null) { depth = SUMMARY; why = "材料なし(標準)"; }
+    return { depth: depth, label: LABELS[depth], name: NAMES[depth], why: why };
+  }
+
+  /** 深さ(1〜4) → 既存の skipMode(1=▶の一時 / 4=結論まで / 0=▶▶ / 3=▶▶▶)。 */
+  function skipModeFor(depth) {
+    if (depth === POINTS) return 1;
+    if (depth === CONCLUSION) return 4;
+    if (depth === TITLE) return 3;
+    return 0;
+  }
+
+  return {
+    decide: decide, durationLevel: durationLevel, skipModeFor: skipModeFor,
+    LABELS: LABELS, NAMES: NAMES
+  };
+});
+</script>
+<script>/*
+ * tts_clean.js - 読み上げ(Web Speech API)用の前処理部品。依存なし・独立。
+ *
+ * ブラウザでは window.TTSClean、Node では module.exports。
+ * 公開: clean(text, opts) / split(text, maxLen) / DEFAULT_DICT / buildDictRegex(dict)
+ *
+ * 古いiOS Safariで構文エラーになる記法は使わない:
+ *   後読み (?<= (?<!、名前付きキャプチャ、replaceAll、.at(、?.、??、\p{...}、\u{...}、uフラグ、CSS inset。
+ * 絵文字はサロゲートペアの範囲指定で除去する。
+ * 巨大入力でも線形時間になるよう、数字・英数字の連続には桁数の上限を付けている。
+ *
+ * opts:
+ *   extraDict   {英語: 読み} 利用者が足す辞書(DEFAULT_DICT より優先)
+ *   skipParens  true なら括弧内を読み飛ばす(既定 false: 括弧は読点に置き換えて中身も読む)
+ *   dropCharCount false なら末尾の「(48文字)」の注記を残す(既定は読まない)
+ *   handleNames {"@name": "読み"} @ユーザー名の読み
+ */
+(function (root, factory) {
+  var api = factory();
+  if (typeof module === "object" && module && module.exports) module.exports = api;
+  else root.TTSClean = api;
+})(typeof self !== "undefined" ? self : this, function () {
+  "use strict";
+
+  // ---------- 辞書 ----------
+  var DEFAULT_DICT = {
+    // AI・ソフト
+    "AI": "エーアイ", "AGI": "エージーアイ", "GPT": "ジーピーティー", "ChatGPT": "チャットジーピーティー",
+    "LLM": "エルエルエム", "ML": "エムエル", "API": "エーピーアイ", "SDK": "エスディーケイ", "MCP": "エムシーピー",
+    "RAG": "ラグ", "SaaS": "サース", "PaaS": "パース", "IaaS": "アイアース", "IoT": "アイオーティー", "OS": "オーエス",
+    "UI": "ユーアイ", "UX": "ユーエックス", "AR": "エーアール", "VR": "ブイアール", "DX": "ディーエックス",
+    "PC": "ピーシー", "PDF": "ピーディーエフ", "URL": "ユーアールエル", "FAQ": "エフエーキュー", "OK": "オーケー",
+    "Sora": "ソラ", "Grok": "グロック", "Perplexity": "パープレキシティ", "Copilot": "コパイロット",
+    "DeepSeek": "ディープシーク", "Llama": "ラマ", "Mistral": "ミストラル", "Siri": "シリ", "Qwen": "クウェン",
+    // 企業・製品
+    "NVIDIA": "エヌビディア", "OpenAI": "オープンエーアイ", "Anthropic": "アンスロピック", "Gemini": "ジェミニ",
+    "Claude": "クロード", "Tesla": "テスラ", "TSMC": "ティーエスエムシー", "ASML": "エーエスエムエル",
+    "AMD": "エーエムディー", "Intel": "インテル", "Qualcomm": "クアルコム", "Samsung": "サムスン",
+    "Google": "グーグル", "Microsoft": "マイクロソフト", "Apple": "アップル", "Amazon": "アマゾン",
+    "AWS": "エーダブリューエス", "Meta": "メタ", "Netflix": "ネットフリックス", "SpaceX": "スペースエックス",
+    "xAI": "エックスエーアイ", "BYD": "ビーワイディー", "Arm": "アーム", "Broadcom": "ブロードコム",
+    "iPhone": "アイフォーン", "iPad": "アイパッド", "iOS": "アイオーエス", "macOS": "マックオーエス",
+    "Android": "アンドロイド", "Windows": "ウィンドウズ", "GitHub": "ギットハブ", "YouTube": "ユーチューブ",
+    "Twitter": "ツイッター", "Node.js": "ノードジェイエス", "Next.js": "ネクストジェイエス", "TypeScript": "タイプスクリプト", "JavaScript": "ジャバスクリプト", "Python": "パイソン", "Bluetooth": "ブルートゥース", "Wi-Fi": "ワイファイ",
+    // 半導体・ハード
+    "USB": "ユーエスビー", "SSD": "エスエスディー", "HDD": "エイチディーディー", "GPU": "ジーピーユー",
+    "CPU": "シーピーユー", "NPU": "エヌピーユー", "TPU": "ティーピーユー", "HBM": "エイチビーエム",
+    "DRAM": "ディーラム", "SRAM": "エスラム", "NAND": "ナンド", "MCU": "エムシーユー", "SoC": "エスオーシー",
+    "FPGA": "エフピージーエー", "ASIC": "エーシック", "LED": "エルイーディー", "OLED": "オーレッド",
+    "EV": "イーブイ", "LiDAR": "ライダー", "EDA": "イーディーエー", "PCB": "ピーシービー",
+    // 経済・ビジネス
+    "CEO": "シーイーオー", "CFO": "シーエフオー", "CTO": "シーティーオー", "COO": "シーオーオー",
+    "ROI": "アールオーアイ", "KPI": "ケーピーアイ", "IPO": "アイピーオー", "ETF": "イーティーエフ",
+    "ESG": "イーエスジー", "SDGs": "エスディージーズ", "M&A": "エムアンドエー", "R&D": "アールアンドディー",
+    "Q&A": "キューアンドエー", "B2B": "ビーツービー", "B2C": "ビーツーシー", "CO2": "シーオーツー",
+    "GDP": "ジーディーピー", "FRB": "エフアールビー", "ECB": "イーシービー", "BOJ": "ビーオージェー",
+    "CPI": "シーピーアイ", "PPI": "ピーピーアイ", "FOMC": "エフオーエムシー", "Fed": "フェド",
+    // 実データ(要約DB)の頻出語から追加
+    "SNS": "エスエヌエス", "LNG": "エルエヌジー", "FSB": "エフエスビー", "RPA": "アールピーエー", "GUI": "ジーユーアイ",
+    "TTS": "ティーティーエス", "BGM": "ビージーエム", "SIM": "シム", "IT": "アイティー", "KNN": "ケーエヌエヌ",
+    "A2A": "エーツーエー", "GaN": "ガン", "SiC": "シリコンカーバイド", "LoRA": "ローラ", "LBMA": "エルビーエムエー",
+    "Codex": "コーデックス", "Devin": "デビン", "Opus": "オーパス", "Sonnet": "ソネット", "Haiku": "ハイク",
+    "Obsidian": "オブシディアン", "Adobe": "アドビ", "Mac": "マック", "ElevenLabs": "イレブンラボ",
+    "Claude Code": "クロードコード", "Computer Use": "コンピューターユース", "Nano Banana": "ナノバナナ",
+    "Dev Day": "デブデイ",
+    "NISA": "ニーサ", "iDeCo": "イデコ", "vs": "ブイエス"
+  };
+
+  function esc(s) { return s.replace(/[.*+?^${}()|[\]\\\/]/g, "\\$&"); }
+
+  // 辞書(オブジェクト)の簡易指紋。キーと値の中身が変わると変わる(長さ+位置つきの軽いハッシュ)
+  function fingerprint(d) {
+    var n = 0, h = 5381, k, v, i, s;
+    for (k in d) {
+      if (!Object.prototype.hasOwnProperty.call(d, k)) continue;
+      v = d[k];
+      if (typeof v !== "string") continue;
+      n++;
+      s = k + "\u0001" + v;
+      for (i = 0; i < s.length; i++) h = ((h * 33) ^ s.charCodeAt(i)) | 0;
+    }
+    return n + ":" + h;
+  }
+
+  // 辞書 -> 置換用の正規表現。同じ内容の辞書なら作り直さない(指紋で判定)。
+  // 4文字以上の英数字の語は大文字小文字を区別しない、3文字以下は区別する(AI が PAIN の中で当たらないように)。
+  var compileCache = {};
+  var compileCount = 0;
+  function buildDictRegex(dict) {
+    dict = dict || {};
+    var sig = fingerprint(dict);
+    if (compileCache[sig]) return compileCache[sig];
+    var keys = Object.keys(dict).filter(function (x) { return x && typeof dict[x] === "string"; });
+    keys.sort(function (a, b) { return b.length - a.length; });
+    var sens = [], ins = [], plain = [], map = {}, mapL = {};
+    keys.forEach(function (x) {
+      if (/^[A-Za-z0-9][\x20-\x7e]*[A-Za-z0-9]$|^[A-Za-z0-9]$/.test(x)) {
+        if (x.length >= 4) { ins.push(esc(x)); mapL[x.toLowerCase()] = dict[x]; }
+        else { sens.push(esc(x)); map[x] = dict[x]; }
+      } else plain.push([x, dict[x]]);
+    });
+    var mk = function (arr, flags) {
+      return arr.length ? new RegExp("(^|[^A-Za-z0-9])(" + arr.join("|") + ")(?:'s|s)?(?![A-Za-z])", flags) : null;
+    };
+    var c = { ins: mk(ins, "gi"), sens: mk(sens, "g"), plain: plain, map: map, mapL: mapL, sig: sig };
+    // キャッシュの肥大を防ぐ(利用者辞書が頻繁に変わっても最大8件)
+    if (compileCount >= 8) { compileCache = {}; compileCount = 0; }
+    compileCache[sig] = c;
+    compileCount++;
+    return c;
+  }
+
+  function mergedDict(extra) {
+    if (!extra || typeof extra !== "object") return DEFAULT_DICT;
+    var d = {}, k;
+    for (k in DEFAULT_DICT) if (Object.prototype.hasOwnProperty.call(DEFAULT_DICT, k)) d[k] = DEFAULT_DICT[k];
+    for (k in extra) if (Object.prototype.hasOwnProperty.call(extra, k) && typeof extra[k] === "string") d[k] = extra[k];
+    return d;
+  }
+
+  // 辞書の適用。dict を渡さなければ DEFAULT_DICT
+  function applyDict(t, dict) {
+    var c = buildDictRegex(dict || DEFAULT_DICT);
+    if (c.ins) t = t.replace(c.ins, function (m, pre, key) { return pre + (c.mapL[key.toLowerCase()] || key); });
+    if (c.sens) t = t.replace(c.sens, function (m, pre, key) { return pre + (c.map[key] || key); });
+    c.plain.forEach(function (p) { t = t.split(p[0]).join(p[1]); });
+    return t;
+  }
+
+  // ---------- 数値の読み下し ----------
+  var NUM = "\\d{1,20}(?:\\.\\d{1,20})?"; // 桁数に上限を付け、長い連続数字でも線形時間にする
+  var MAGS = { k: 3, thousand: 3, m: 6, million: 6, b: 9, billion: 9, t: 12, trillion: 12 };
+  var MAG_FALLBACK = { 3: "千", 6: "百万", 9: "十億", 12: "兆" };
+
+  // "12000000" -> "1200万"(20桁まで)
+  function jpFromDigits(s) {
+    s = s.replace(/^0+(?=\d)/, "");
+    if (s.length > 20) return s;
+    var groups = [];
+    for (var i = s.length; i > 0; i -= 4) groups.unshift(s.slice(Math.max(0, i - 4), i));
+    var units = ["", "万", "億", "兆", "京"], out = "";
+    for (var j = 0; j < groups.length; j++) {
+      var v = parseInt(groups[j], 10);
+      if (v > 0) out += v + units[groups.length - 1 - j];
+    }
+    return out || "0";
+  }
+  // 1.5 + B -> 15億 / 300 + k -> 30万。割り切れなければ素直に単位語を付ける。
+  function amount(numStr, mag) {
+    if (!mag) return numStr;
+    mag = mag.replace(/^\s+/, "");
+    if (/^[万億兆]$/.test(mag)) return numStr + mag;
+    var exp = MAGS[mag.toLowerCase()];
+    if (exp == null) return numStr + mag;
+    var parts = numStr.split("."), frac = parts[1] || "";
+    var e = exp - frac.length;
+    if (e < 0) return numStr + MAG_FALLBACK[exp];
+    var digits = (parts[0] + frac).replace(/^0+(?=\d)/, "");
+    for (var i = 0; i < e; i++) digits += "0";
+    if (digits.length <= 4) return digits;
+    return jpFromDigits(digits);
+  }
+
+  var CURRENCY = { "$": "ドル", "¥": "円", "€": "ユーロ", "£": "ポンド", "₩": "ウォン", "₹": "ルピー" };
+  var MAG_RE = "(\\s?(?:million|billion|trillion|thousand)\\b|[kKmMbBtT](?![A-Za-z])|[万億兆])";
+  var RE_CURRENCY = new RegExp("(?:US|U\\.S\\.)?([$¥€£₩₹])\\s?(" + NUM + ")" + MAG_RE + "?", "g");
+  var RE_MAG_PLAIN = new RegExp("(^|[^A-Za-z0-9.])(" + NUM + ")(\\s?(?:million|billion|trillion)\\b|k(?![A-Za-z])|[MB](?![A-Za-z]))", "g");
+
+  var UNITS = [
+    ["THz", "テラヘルツ"], ["GHz", "ギガヘルツ"], ["MHz", "メガヘルツ"], ["kHz", "キロヘルツ"], ["Hz", "ヘルツ"],
+    ["TWh", "テラワット時"], ["GWh", "ギガワット時"], ["MWh", "メガワット時"], ["kWh", "キロワット時"], ["Wh", "ワット時"],
+    ["TW", "テラワット"], ["GW", "ギガワット"], ["MW", "メガワット"], ["kW", "キロワット"], ["mW", "ミリワット"], ["W", "ワット"],
+    ["kV", "キロボルト"], ["mV", "ミリボルト"], ["V", "ボルト"],
+    ["kA", "キロアンペア"], ["mAh", "ミリアンペア時"], ["mA", "ミリアンペア"], ["Ah", "アンペア時"], ["A", "アンペア"],
+    ["nm", "ナノメートル"], ["μm", "マイクロメートル"], ["mm", "ミリメートル"], ["cm", "センチメートル"],
+    ["km/h", "キロメートル毎時"], ["km", "キロメートル"], ["m", "メートル"],
+    ["kg", "キログラム"], ["mg", "ミリグラム"], ["g", "グラム"],
+    ["TB/s", "テラバイト毎秒"], ["GB/s", "ギガバイト毎秒"], ["MB/s", "メガバイト毎秒"],
+    ["TB", "テラバイト"], ["GB", "ギガバイト"], ["MB", "メガバイト"], ["kB", "キロバイト"], ["KB", "キロバイト"],
+    ["Tbps", "テラビット毎秒"], ["Gbps", "ギガビット毎秒"], ["Mbps", "メガビット毎秒"], ["kbps", "キロビット毎秒"],
+    ["EFLOPS", "エクサフロップス"], ["PFLOPS", "ペタフロップス"], ["TFLOPS", "テラフロップス"], ["GFLOPS", "ギガフロップス"],
+    ["ns", "ナノ秒"], ["μs", "マイクロ秒"], ["ms", "ミリ秒"], ["dB", "デシベル"], ["kcal", "キロカロリー"], ["G", "ジー"]
+  ];
+  var UNIT_MAP = {};
+  UNITS.forEach(function (u) { UNIT_MAP[u[0]] = u[1]; });
+  var UNIT_KEYS = UNITS.map(function (u) { return u[0]; }).sort(function (a, b) { return b.length - a.length; });
+  var RE_UNIT = new RegExp("(" + NUM + ")(\\s?)(" + UNIT_KEYS.map(esc).join("|") + ")(?![A-Za-z])", "g");
+  var SINGLE_UNITS = { W: 1, V: 1, A: 1, m: 1, g: 1, G: 1 };
+
+  function validMD(m, d) { return m >= 1 && m <= 12 && d >= 1 && d <= 31; }
+  // 月日の文脈語(日付・期日・曜日・発表/発売/開催などの直前直後)
+  var RE_DATE_CTX_BEFORE = /(?:日付|期日|期限|締切|締め切り|発売日|公開日|開催日|発表日|予定日|リリース日|配信日|開始日|終了日|更新日|投稿日|〆|来週|再来週|今週|先週|来月|今月|先月|本日|今日|明日|明後日|昨日|当日|翌日|同日|米国時間|日本時間|現地時間|東部時間|太平洋時間|(?:^|[^A-Za-z])(?:date|dated|deadline|due|on|by|until|till|since|from|before|after|today|tomorrow|yesterday|starting|starts|ends|as of|effective|week of))[\s:：は]{0,3}$/i;
+  var RE_DATE_CTX_AFTER = /^(?:\s?[(（][月火水木金土日祝](?:曜日?)?[)）]|\s?[月火水木金土日]曜|(?:の|に|には|は)?(?:発表|発売|公開|開催|開始|リリース|実施|施行|配信|終了|締切|締め切り|期限|登場|開幕|予定|スタート|解禁|出荷|納期|時点|現在|以降|以前|まで|から|より|付け?(?:の|で)?)|(?:に|には|にも)(?!達|到|近|なる|なった|相当|匹敵|対し|比べ|とどま)|\s?(?:\(|（)\d|\s?(?:event|launch|release|keynote|conference|summit|meeting|webinar|deadline|sale|update|expo|show|day|ship|ships|starts?|ends?|opens?)(?![A-Za-z]))/i;
+
+  function readNumbers(t) {
+    // 桁区切りカンマ(1,200 -> 1200)。5桁以上で「万/億/兆」が続かないものは万・億の読み下しにする
+    // (12,000,000円 -> 1200万円)
+    for (var i = 0; i < 4; i++) t = t.replace(/(\d),(\d{3})(?!\d)/g, "$1$2");
+    t = t.replace(/(^|[^\d.])(\d{5,16})(?![\d.]|[万億兆])/g, function (m, pre, d, off, str) {
+      // 誤爆(郵便番号・型番)を避けるため、「円・人・件」等の量の語が続く場合に限る
+      var after = str.slice(off + m.length, off + m.length + 2);
+      if (!/^(?:円|ドル|人|件|台|社|個|票|世帯|店|回|軒|名|冊|本|株)/.test(after)) return m;
+      return pre + jpFromDigits(d);
+    });
+    // 日付
+    t = t.replace(/(^|[^\d])(\d{4})[\/.\-](\d{1,2})[\/.\-](\d{1,2})(?!\d)/g, function (m, pre, y, mo, d) {
+      return validMD(+mo, +d) ? pre + (+mo) + "月" + (+d) + "日" : m;
+    });
+    t = t.replace(/(^|[^\d\/])(\d{4})\/(\d{1,2})(?![\d\/])/g, function (m, pre, y, mo) {
+      return +mo >= 1 && +mo <= 12 ? pre + y + "年" + (+mo) + "月" : m;
+    });
+    t = t.replace(/(^|[^\d])24\/7(?![\d\/])/g, "$124時間365日");
+    // 「4.5/5点」は点数
+    t = t.replace(/(^|[^\d\/.\-:])(\d{1,3}\.\d{1,2})\/(\d{1,3})\s?点/g, function (m, pre, a, b) {
+      return +a <= +b && +b > 0 ? pre + b + "点満点中" + a + "点" : m;
+    });
+    // 「4/5〜4/7」は日付の範囲(終わりが始まりより後、または年またぎ)
+    t = t.replace(/(^|[^\d\/.\-:])(\d{1,2})\/(\d{1,2})\s?[〜~\-–−―‐]\s?(\d{1,2})\/(\d{1,2})(?![\d\/])/g, function (m, pre, m1, d1, m2, d2) {
+      if (!validMD(+m1, +d1) || !validMD(+m2, +d2)) return m;
+      var ordered = +m2 > +m1 || (+m2 === +m1 && +d2 > +d1) || (+m1 >= 11 && +m2 <= 2);
+      return ordered ? pre + (+m1) + "月" + (+d1) + "日から" + (+m2) + "月" + (+d2) + "日" : m;
+    });
+    // 年の無い n/n は、月日の文脈語が前後にある時だけ日付にする。それ以外は後段で「n分のn」と読む
+    t = t.replace(/(^|[^\d\/.\-:])(\d{1,2})\/(\d{1,2})(?![\d\/])/g, function (m, pre, mo, d, off, str) {
+      if (!validMD(+mo, +d)) return m;
+      var before = str.slice(Math.max(0, off - 12), off + pre.length);
+      var after = str.slice(off + m.length, off + m.length + 12);
+      return RE_DATE_CTX_BEFORE.test(before) || RE_DATE_CTX_AFTER.test(after) ? pre + (+mo) + "月" + (+d) + "日" : m;
+    });
+    // 時刻 10:30 -> 10時30分
+    t = t.replace(/(^|[^\d:])(\d{1,2}):(\d{2})(?![\d:])/g, function (m, pre, h, mi) {
+      if (+h > 24 || +mi > 59) return m;
+      return pre + (+h) + "時" + (+mi === 0 ? "" : (+mi) + "分");
+    });
+    // 通貨
+    t = t.replace(RE_CURRENCY, function (m, sym, num, mag) { return amount(num, mag) + CURRENCY[sym]; });
+    // 通貨なしの 5M / 1.5B / 10k / 3 million
+    t = t.replace(RE_MAG_PLAIN, function (m, pre, num, mag) { return pre + amount(num, mag); });
+    // パーセント・温度
+    t = t.replace(/(\d)\s?%/g, "$1パーセント");
+    t = t.replace(new RegExp("(" + NUM + ")\\s?°\\s?F", "g"), "華氏$1度");
+    t = t.replace(/(\d)\s?°\s?C?/g, "$1度");
+    // 単位
+    t = t.replace(RE_UNIT, function (m, num, sp, unit, off, str) {
+      if (sp && SINGLE_UNITS[unit]) return m;
+      var prev = off > 0 ? str.charAt(off - 1) : "";
+      if (/[A-Za-z]/.test(prev)) return m; // A100, H100 など型番
+      if (SINGLE_UNITS[unit] && off > 1 && /[A-Za-z]-/.test(str.substr(off - 2, 2))) return m; // GPT-4V など
+      return num + UNIT_MAP[unit];
+    });
+    // 倍・かける
+    t = t.replace(/(\d)\s?[x×](?![A-Za-z0-9])/g, "$1倍");
+    t = t.replace(/(\d)\s?×(?=\d)/g, "$1かける");
+    return t;
+  }
+
+  // ---------- clean ----------
+  var CIRCLED = "①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮⑯⑰⑱⑲⑳";
+  // 絵文字: サロゲートペア(U+1F000-1FFFF)と、BMP内の記号・絵文字・異体字セレクタ・ZWJ・囲み
+  var RE_EMOJI = /[\uD83C-\uD83E][\uDC00-\uDFFF]|[⌀-⏿■-➿⤀-⥿⬀-⯿〰〽㊗㊙️︎‍⃣-]/g;
+  var RE_URL = /(?:https?:\/\/|www\.)[A-Za-z0-9\-._~:\/?#\[\]@!$&'()*+,;=%]*[A-Za-z0-9\-_~\/=%#]|\b(?:[A-Za-z0-9\-]{1,63}\.){1,10}(?:com|net|org|io|ai|dev|app|jp|co|me|ly|gl|us|uk|tv|xyz|info|biz)(?:\/[A-Za-z0-9\-._~:\/?#\[\]@!$&'()*+,;=%]*[A-Za-z0-9\-_~\/=%#])?(?![A-Za-z0-9])/g;
+  var RE_EMAIL = /[A-Za-z0-9._%+\-]{1,64}@[A-Za-z0-9.\-]{1,255}\.[A-Za-z]{2,}/g;
+  var JPC = "\\u3040-\\u30FF\\u3400-\\u4DBF\\u4E00-\\u9FFF";
+  var RE_KANA_BETWEEN = new RegExp("([" + JPC + "])\\s+(?=[" + JPC + "])", "g");
+  // 読み上げに残す文字: 英数字・空白・ラテン拡張・かな・漢字・半角カナ・々〇・句読点
+  var RE_UNREADABLE = /[^A-Za-z0-9\sÀ-ɏ぀-ヿ㐀-䶿一-鿿ｦ-ﾟ々〇。、！？.'・]/g;
+
+  function handleReading(name, names) {
+    if (names) {
+      var low = name.toLowerCase();
+      for (var k in names) if (Object.prototype.hasOwnProperty.call(names, k) && k.replace(/^@/, "").toLowerCase() === low) return String(names[k]);
+    }
+    var toks = name.split("_").filter(function (x) { return /[A-Za-z]/.test(x); });
+    return toks.map(function (x) { return x.replace(/(\D)\d{3,}$/, "$1"); }).join(" ");
+  }
+
+  function clean(text, opts) {
+    if (text == null) return "";
+    opts = opts || {};
+    var t = String(text);
+    t = t.replace(/[①-⑳]/g, function (c) { return "\n" + (CIRCLED.indexOf(c) + 1) + ". "; });
+    if (t.normalize) t = t.normalize("NFKC");
+    t = t.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f\u200b\u200c\u2060\ufeff]/g, " ");
+    t = t.replace(/\r\n?|\u2028|\u2029/g, "\n");
+    t = t.replace(/[’‘`´]/g, "'");
+    // 水平空白の連続を先に1つにする(後段の \s* との組合せによる二乗時間を避ける)
+    t = t.replace(/[ \t\u3000\u00a0]{2,}/g, " ");
+
+    t = t.replace(RE_EMAIL, " ").replace(RE_URL, " ").replace(RE_EMOJI, ""); // メールを先に(foo@ex.com の ex.com を URL と誤認しない)
+    // C# / F# はハッシュタグ除去より前に読みを確定させる。e.g. / i.e. / etc. も英語のドット処理の前に置き換える
+    t = t.replace(/(^|[^A-Za-z0-9])([CF])#(?![A-Za-z0-9])/g, function (m, pre, l) { return pre + (l === "C" ? "シー" : "エフ") + "シャープ"; });
+    t = t.replace(/(^|[^A-Za-z0-9])e\.g\.(?![A-Za-z])/gi, "$1例えば ").replace(/(^|[^A-Za-z0-9])i\.e\.(?![A-Za-z])/gi, "$1つまり ").replace(/(^|[^A-Za-z0-9])etc\.(?![A-Za-z])/gi, "$1など ");
+    // Markdown の強調・コード記号(**太字**, __, `)は読まない
+    t = t.replace(/\*{1,3}|_{2,}|~~/g, "");
+
+    // 箇条書き・番号(括弧処理より前)
+    t = t.replace(/^[ \t]*(?:[-*]\s+|・\s*)/gm, "");
+    t = t.replace(/^[ \t]*\((\d{1,2})\)[ \t]*(?=\S)/gm, "$1. ");
+    t = t.replace(/(^|[。!?][ \t]*)(\d{1,2})[.)](?!\d)[ \t]*(?=\S)/gm, "$1$2件目、");
+    t = t.replace(/(^|\s)(\d{1,2})\)(?=\s|[぀-ヿ㐀-鿿])\s?/g, "$1$2件目、");
+
+    // 「4/5(月)」の曜日つきは確実な日付(括弧ごと消える前に日付へ)
+    t = t.replace(/(^|[^\d\/.\-:])(\d{1,2})\/(\d{1,2})\s?\([月火水木金土日祝](?:曜日?)?\)/g, function (m, pre, mo, d) {
+      return validMD(+mo, +d) ? pre + (+mo) + "月" + (+d) + "日" : m;
+    });
+
+    // 要約の末尾に付く文字数の注記「（48文字）」は読まない(opts.dropCharCount === false で残す)
+    if (opts.dropCharCount !== false) t = t.replace(/[(（]\d{1,4}文字[)）]/g, "");
+
+    // 括弧: skipParens なら中身ごと消す。既定は読点に置き換えて中身も読む
+    if (opts.skipParens) {
+      for (var i = 0; i < 6; i++) {
+        var before = t;
+        t = t.replace(/\([^()]*\)/g, "");
+        if (t === before) break;
+      }
+      t = t.replace(/[()]/g, " ");
+    } else {
+      t = t.replace(/\) ?(?=[とのをはがにでもへ])/g, " ").replace(/[()]/g, "、"); // 閉じ括弧の直後が助詞なら間を置かない
+    }
+
+    // 改行 -> 句点
+    t = t.split("\n").map(function (l) { return l.replace(/^\s+|\s+$/g, ""); }).filter(Boolean).map(function (l) {
+      l = l.replace(/[:：]$/, "");
+      return /[。!?.]$/.test(l) ? l : l + "。";
+    }).join("");
+
+    // ハッシュタグ・キャッシュタグ・@handle
+    t = t.replace(/(^|[^A-Za-z0-9_@])@([A-Za-z0-9_]{1,30})/g, function (m, pre, name) {
+      var r = handleReading(name, opts.handleNames);
+      return pre + (r ? r : "");
+    });
+    t = t.replace(/#(?=\S)/g, "").replace(/\$([A-Za-z]{1,6})(?![A-Za-z0-9])/g, "$1");
+
+    // 数値・単位
+    t = readNumbers(t);
+
+    // 英略語辞書
+    t = applyDict(t, mergedDictCached(opts.extraDict));
+
+    // 範囲・マイナス・プラス
+    t = t.replace(/(\d|[日時分年月円度倍件])(?:[-−‐‑‒–—―~〜]|\s[-−‐‑‒–—―~〜]\s)(?=\d)/g, "$1から");
+    t = t.replace(/(^|[\s、。!?぀-ゟ一-鿿])[-−–]\s?(?=\d)/g, "$1マイナス");
+    t = t.replace(/(^|[\s、。!?぀-ゟ一-鿿])\+(?=\d)/g, "$1プラス");
+    t = t.replace(/[-−‐‑‒–~〜]/g, " ").replace(/[—―]/g, "、");
+
+    // 記号の置換(現行の youtube-manager の「：:×・ -> 、」と矛盾しないよう、: と × はここで先に処理)
+    t = t.replace(/&/g, "アンド").replace(/=/g, "イコール").replace(/\+/g, "プラス");
+    t = t.replace(/(\d{1,20}):(\d{1,20})/g, "$1対$2");
+    t = t.replace(/(\d{1,20})\/(\d{1,20})/g, "$2分の$1");
+    t = t.replace(/×/g, "、");
+    t = t.replace(/[\/|]/g, "、").replace(/[:;,]/g, "、").replace(/[【「『]/g, " ").replace(/[」』](?=[とのをはがにでもへ])/g, " ").replace(/[】」』]/g, "、");
+    t = t.replace(/%/g, "パーセント").replace(/°/g, "度");
+    t = t.replace(/\.{2,}|…+/g, "、").replace(/!+/g, "!").replace(/\?+/g, "?").replace(/[!]/g, "！").replace(/[?]/g, "？");
+
+    // 英語のドット: 小数点以外は句点か空白に
+    t = t.replace(/\./g, function (m, off, str) {
+      var p = str.charAt(off - 1), n = str.charAt(off + 1);
+      if (/\d/.test(p) && /\d/.test(n)) return m;
+      if (n === "" || /[\s。、！？]/.test(n)) return "。";
+      return " ";
+    });
+    // 所有格 's は、辞書語・カタカナ語のあとでは読まない。残りのアポストロフィは英字間のみ残す
+    t = t.replace(/([ァ-ヶー])'s(?![A-Za-z])/g, "$1");
+    t = t.replace(/'(?![A-Za-z])|(^|[^A-Za-z])'/g, "$1");
+
+    // 読める文字だけを残す
+    t = t.replace(RE_UNREADABLE, " ");
+    t = t.replace(/[ \t\u3000]+/g, " ");
+    // 日本語同士の空白は除くが、カタカナ同士(辞書置換語が連続する場合など)は区切りとして残す
+    t = t.replace(RE_KANA_BETWEEN, function (m, a, off, str) {
+      var b = str.charAt(off + m.length);
+      return /[ァ-ヶー]/.test(a) && /[ァ-ヶー]/.test(b) ? m : a;
+    });
+    t = t.replace(/\s*([。、！？])\s*/g, "$1");
+    t = t.replace(/、+/g, "、").replace(/[、。]*。[、。]*/g, "。").replace(/、([！？])/g, "$1").replace(/。([！？])/g, "$1");
+    t = t.replace(/([！？])[、。]/g, "$1").replace(/^[。、！？\s]+/, "");
+    return t.replace(/\s+/g, " ").replace(/^\s+|\s+$/g, "");
+  }
+
+  // extraDict のオブジェクトが同じ(内容も同じ)なら統合辞書を作り直さない
+  var mergedCache = { src: null, sig: null, d: null };
+  function mergedDictCached(extra) {
+    if (!extra || typeof extra !== "object") return DEFAULT_DICT;
+    var sig = fingerprint(extra) + "|" + fingerprint(DEFAULT_DICT);
+    if (mergedCache.sig === sig && mergedCache.d) return mergedCache.d;
+    var d = mergedDict(extra);
+    mergedCache = { src: extra, sig: sig, d: d };
+    return d;
+  }
+
+  // ---------- split ----------
+  function hardSplit(s, maxLen) {
+    var out = [];
+    while (s.length > maxLen) {
+      var cut = s.lastIndexOf(" ", maxLen);
+      if (cut < maxLen * 0.5) cut = maxLen;
+      out.push(s.slice(0, cut).replace(/\s+$/, ""));
+      s = s.slice(cut).replace(/^\s+/, "");
+    }
+    if (s) out.push(s);
+    return out;
+  }
+  // 文(。！？)で分け、maxLen を超える文は読点(、)で、それでも長ければ空白または maxLen で分ける
+  function split(text, maxLen) {
+    maxLen = maxLen > 0 ? maxLen : 80;
+    var t = String(text == null ? "" : text);
+    var sentences = t.match(/[^。！？!?\n]+[。！？!?]*|[。！？!?]+/g) || [];
+    var out = [];
+    sentences.forEach(function (raw) {
+      var s = raw.replace(/^\s+|\s+$/g, "");
+      if (!s || /^[。！？!?\s]+$/.test(s)) return;
+      if (s.length <= maxLen) { out.push(s); return; }
+      var pieces = s.match(/[^、,，]+[、,，]?/g) || [s];
+      var cur = "";
+      pieces.forEach(function (p) {
+        if (p.length > maxLen) {
+          if (cur) { out.push(cur); cur = ""; }
+          hardSplit(p, maxLen).forEach(function (x) { out.push(x); });
+        } else if ((cur + p).length > maxLen) { out.push(cur); cur = p; }
+        else cur += p;
+      });
+      if (cur) out.push(cur);
+    });
+    return out.map(function (x) { return x.replace(/^\s+|\s+$/g, ""); }).filter(Boolean);
+  }
+
+  return { clean: clean, split: split, DEFAULT_DICT: DEFAULT_DICT, buildDictRegex: buildDictRegex, applyDict: applyDict, _compileCount: function () { return compileCount; } };
+});
+</script>
+<script>/*
+ * tts_user_dict.js - 読み上げの「利用者辞書」(間違って読まれる言葉の読みを、利用者が足す)のロジック。依存なし・独立。
+ *
+ * ブラウザでは window.TtsUserDict、Node では module.exports。統合HTMLに埋め込む(tts_clean.js の extraDict に渡す)。
+ *
+ * 保存:
+ *   端末(localStorage): 自分の登録(未送信分)と、共有辞書のキャッシュ
+ *   共有(Supabase yt_tts_dict): 追加のみ・合言葉つき。同じ言葉は新しい行が勝つ。読みが空の行は「削除」を表す
+ * 登録はまず端末に保存し(すぐ読み上げに効く)、そのあと共有へ送る。送れなかった分は、次に開いたときに再送する。
+ *
+ * 古いiOS Safariで構文エラーになる記法(アロー関数・let/const・テンプレート文字列・?.・??・async/await)は使わない。
+ */
+(function (root, factory) {
+  var api = factory();
+  if (typeof module === "object" && module && module.exports) module.exports = api;
+  else root.TtsUserDict = api;
+})(typeof self !== "undefined" ? self : this, function () {
+  "use strict";
+
+  var MAX_WORDS = 500;       // 登録できる言葉の数(有効なもの)
+  var MAX_WORD = 40;         // 言葉の長さ
+  var MAX_READING = 60;      // 読みの長さ
+  var REMOTE_KEY = "ytTtsDictRemote";
+  var LOCAL_KEY = "ytTtsDictLocal";
+
+  function str(x) { return typeof x === "string" ? x : (x === null || x === undefined ? "" : String(x)); }
+  function norm(x) { return str(x).replace(/^\s+|\s+$/g, ""); }
+  function hasControl(s) {
+    for (var i = 0; i < s.length; i++) { var c = s.charCodeAt(i); if (c < 32 || c === 127) return true; }
+    return false;
+  }
+
+  /** 登録してよい組か。問題が無ければ空文字、あれば日本語のメッセージ。 */
+  function validate(word, reading) {
+    var w = norm(word), r = norm(reading);
+    if (!w) return "言葉を入力してください";
+    if (w.length > MAX_WORD) return "言葉は" + MAX_WORD + "文字までです";
+    if (hasControl(w)) return "言葉に使えない文字が入っています";
+    if (!r) return "正しい読みを入力してください";
+    if (r.length > MAX_READING) return "読みは" + MAX_READING + "文字までです";
+    if (hasControl(r)) return "読みに使えない文字が入っています";
+    if (w === r) return "言葉と読みが同じです";
+    return "";
+  }
+
+  /**
+   * 共有の行(古い順: [{w, r}])と、端末の未送信の登録(古い順: [{w, r, t}])から、有効な辞書 {言葉: 読み} を作る。
+   * 新しいものが勝つ。読みが空の行は削除。端末の未送信分は、共有の行より後(=新しい)として重ねる。
+   */
+  function buildDict(remoteRows, localEntries) {
+    var d = {}, i, e;
+    var rr = remoteRows || [], ll = localEntries || [];
+    for (i = 0; i < rr.length; i++) { e = rr[i]; if (e && typeof e.w === "string" && e.w) { if (e.r) d[e.w] = e.r; else delete d[e.w]; } }
+    for (i = 0; i < ll.length; i++) { e = ll[i]; if (e && typeof e.w === "string" && e.w) { if (e.r) d[e.w] = e.r; else delete d[e.w]; } }
+    return d;
+  }
+
+  function readJson(storage, key) {
+    try {
+      if (!storage) return null;
+      var v = JSON.parse(storage.getItem(key) || "null");
+      return v;
+    } catch (e) { return null; }
+  }
+  function writeJson(storage, key, v) {
+    try { if (storage) storage.setItem(key, JSON.stringify(v)); } catch (e) { /* 保存できなくても、この回は使える */ }
+  }
+  function cleanList(list, withTime) {
+    var out = [];
+    if (!(list instanceof Array)) return out;
+    for (var i = 0; i < list.length; i++) {
+      var e = list[i];
+      if (!e || typeof e.w !== "string" || !e.w || e.w.length > MAX_WORD * 2 || typeof e.r !== "string" || e.r.length > MAX_READING * 2) continue;
+      out.push(withTime ? { w: e.w, r: e.r, t: typeof e.t === "number" ? e.t : 0 } : { w: e.w, r: e.r });
+    }
+    return out;
+  }
+
+  /**
+   * 辞書の置き場。opts: {storage, device, now}
+   *   storage  localStorage 互換(無ければ、このページを開いている間だけの記憶)
+   */
+  function createStore(opts) {
+    opts = opts || {};
+    var storage = opts.storage || null;
+    var memory = {};
+    var now = opts.now || function () { return new Date().getTime(); };
+    var device = opts.device || "";
+    var remote = [], local = [];
+    var version = 0, cache = null, cacheVersion = -1;
+
+    function readRaw(key) { return storage ? readJson(storage, key) : (memory[key] || null); }
+    function writeRaw(key, v) { if (storage) writeJson(storage, key, v); else memory[key] = v; }
+    function save() { writeRaw(REMOTE_KEY, remote); writeRaw(LOCAL_KEY, local); version++; }
+    function load() {
+      remote = cleanList(readRaw(REMOTE_KEY), false);
+      local = cleanList(readRaw(LOCAL_KEY), true);
+      version++;
+    }
+    load();
+
+    function dict() {
+      if (cache && cacheVersion === version) return cache;
+      cache = buildDict(remote, local);
+      cacheVersion = version;
+      return cache;
+    }
+    function count() { var n = 0, k, d = dict(); for (k in d) if (Object.prototype.hasOwnProperty.call(d, k)) n++; return n; }
+    function isLocalActive(w) {
+      for (var i = local.length - 1; i >= 0; i--) if (local[i].w === w) return !!local[i].r;
+      return false;
+    }
+
+    /** 画面に出す一覧: 端末だけ(未送信)を先に新しい順、そのあと共有を言葉の順。 */
+    function entries() {
+      var d = dict(), out = [], k, i, seen = {};
+      for (i = local.length - 1; i >= 0; i--) {
+        var w = local[i].w;
+        if (seen[w]) continue;
+        seen[w] = 1;
+        if (d[w]) out.push({ w: w, r: d[w], status: "local" });
+      }
+      var rest = [];
+      for (k in d) if (Object.prototype.hasOwnProperty.call(d, k) && !seen[k]) rest.push({ w: k, r: d[k], status: "shared" });
+      rest.sort(function (a, b) { return a.w < b.w ? -1 : (a.w > b.w ? 1 : 0); });
+      return out.concat(rest);
+    }
+
+    function putLocal(w, r) {
+      var next = [], i;
+      for (i = 0; i < local.length; i++) if (local[i].w !== w) next.push(local[i]);      // 同じ言葉の古い未送信分は、最新だけ残す
+      next.push({ w: w, r: r, t: now() });
+      local = next;
+      save();
+    }
+
+    /** 登録。戻り値 {ok, error}。 */
+    function add(word, reading) {
+      var err = validate(word, reading);
+      if (err) return { ok: false, error: err };
+      var w = norm(word), r = norm(reading), d = dict();
+      if (!Object.prototype.hasOwnProperty.call(d, w) && count() >= MAX_WORDS) return { ok: false, error: "登録できるのは" + MAX_WORDS + "語までです" };
+      putLocal(w, r);
+      return { ok: true, error: "" };
+    }
+
+    /** 削除(読みが空の行を新しく積む)。 */
+    function remove(word) {
+      var w = norm(word);
+      if (!w) return false;
+      putLocal(w, "");
+      return true;
+    }
+
+    function unsent() { return local.slice(); }
+
+    /**
+     * 共有と同期する。client: {submit(row) -> Promise<'sent'|...>, listRows(select) -> Promise<rows>}。無ければ何もしない。
+     * 1) 端末の未送信を古い順に送る(失敗したらそこで止める。残りは次回)  2) 共有の辞書を取り直してキャッシュにする
+     * 戻り値: Promise<{sent, failed, fetched}>。例外は出さない。
+     */
+    function sync(client) {
+      var result = { sent: 0, failed: 0, rejected: 0, denied: false, fetched: false };
+      if (!client) return Promise.resolve(result);
+      var queue = local.slice(), stopped = false;
+      var chain = Promise.resolve();
+      queue.forEach(function (entry) {
+        chain = chain.then(function () {
+          if (stopped) return null;
+          return client.submit({ word: entry.w, reading: entry.r, device: device || null }).then(function (res) {
+            if (res === "sent") {
+              result.sent++;
+              var keep = [], i;
+              for (i = 0; i < local.length; i++) if (!(local[i].w === entry.w && local[i].t === entry.t)) keep.push(local[i]);
+              local = keep;
+              remote.push({ w: entry.w, r: entry.r });
+              save();
+            } else if (res === "rejected") {
+              // この1件は、共有に受け付けられなかった(形式エラー・表がまだ無い など)。再送しても通らないので、
+              // この回は飛ばして、後ろの登録を送る。端末には残る(「端末のみ」のまま・次の回にもう一度試す)。
+              result.rejected++;
+            } else if (res === "denied") { stopped = true; result.failed++; result.denied = true; }      // 合言葉が無い・違う・1日の上限
+            else { stopped = true; result.failed++; }                                                  // 通信できない・サーバーの不調
+          }, function () { stopped = true; result.failed++; });
+        });
+      });
+      return chain.then(function () {
+        if (!client.listRows) return result;
+        return client.listRows("id,word,reading").then(function (rows) {
+          var out = [], i;
+          for (i = 0; i < rows.length; i++) {
+            var row = rows[i];
+            if (row && typeof row.word === "string" && row.word) out.push({ w: row.word, r: typeof row.reading === "string" ? row.reading : "" });
+          }
+          remote = out;
+          result.fetched = true;
+          save();
+          return result;
+        }, function () { return result; });
+      }).then(function (r) { return r; }, function () { return result; });
+    }
+
+    /** 書き出し(有効な辞書だけ)。取り込みは追加として扱い、検証に通らないものは数えて捨てる。 */
+    function exportText() {
+      var items = [], d = dict(), k;
+      for (k in d) if (Object.prototype.hasOwnProperty.call(d, k)) items.push({ w: k, r: d[k] });
+      return JSON.stringify({ v: 1, items: items });
+    }
+    function importText(text) {
+      var obj;
+      try { obj = JSON.parse(norm(text)); } catch (e) { return { ok: false, error: "読み取れませんでした。文字列が途中で切れていないか確認してください", added: 0, skipped: 0 }; }
+      if (!obj || !(obj.items instanceof Array)) return { ok: false, error: "辞書のデータの形式ではありません", added: 0, skipped: 0 };
+      var added = 0, skipped = 0, i;
+      for (i = 0; i < obj.items.length; i++) {
+        var it = obj.items[i];
+        var res = it ? add(it.w, it.r) : { ok: false };
+        if (res.ok) added++; else skipped++;
+      }
+      return { ok: true, error: "", added: added, skipped: skipped };
+    }
+
+    return { dict: dict, count: count, entries: entries, add: add, remove: remove, unsent: unsent, sync: sync, reload: load,
+             exportText: exportText, importText: importText, isLocalActive: isLocalActive };
+  }
+
+  return {
+    MAX_WORDS: MAX_WORDS, MAX_WORD: MAX_WORD, MAX_READING: MAX_READING, REMOTE_KEY: REMOTE_KEY, LOCAL_KEY: LOCAL_KEY,
+    validate: validate, buildDict: buildDict, createStore: createStore
+  };
+});
+</script>
+<script>/*
+ * labels.js - 人手のラベル付け(盲検・1〜5)のロジック。依存なし・独立(統合HTMLに埋め込む / node でテストする)。
+ *
+ * 公開: cardKey(item) / pickBatch(pool, opts) / dailyState(count) / jstDay(date) / createClient(cfg)
+ *   cardKey   カードの識別キー。動画IDが取れれば動画ID、無ければURLそのもの(Python側 video_id_of(url) or url と同じ)
+ *   pickBatch 出題する1回分(既定20件)を選ぶ。AI点(1〜5)で層化したランダム。各カードの選ばれた確率(inclusion_p)を返す。
+ *             再テスト(2日以上前に答えたカード)を1件混ぜる。
+ *   dailyState 1日の上限(既定60件=20件×3回)に対する、残りと次の回の件数
+ *   createClient  Supabase REST(yt_labels)の読み書き。送れなかった分は端末に溜めて、次の機会に再送する
+ *             cfg.table / cfg.queueKey を渡すと、別の表(👍👎の yt_feedback)にも同じ仕組みで送れる
+ *   thumbRating / buildFeedbackRow  再生中のカードへの👍👎。表示している点を1つ上げ下げした点(1〜5)を、1行にして送る(盲検ではない)
+ *
+ * 古いiOS Safariで構文エラーになる記法(アロー関数・let/const・?.・??・replaceAll・後読み・async/await)は使わない。
+ */
+(function (root, factory) {
+  var api = factory();
+  if (typeof module === "object" && module && module.exports) module.exports = api;
+  else root.YtLabels = api;
+})(typeof self !== "undefined" ? self : this, function () {
+  "use strict";
+
+  var ROUND = 20;           // 1回の件数
+  var DAILY_CAP = 60;       // 1日の上限(3回分)
+  var QUOTA = { 5: 3, 4: 5, 3: 6, 2: 4, 1: 2 };    // 20件の内訳(AI点別)。高い点と低い点も、必ず混ぜる
+  var REPEAT_MIN_DAYS = 2;
+  var QUEUE_KEY = "ytLabelQueue";
+  var LISTED_MAX = 20000;
+
+  // ---------- カードの識別 ----------
+  function videoId(url) {
+    if (!url || typeof url !== "string") return "";
+    var m = /[?&]v=([A-Za-z0-9_-]{6,})/.exec(url);
+    if (m) return m[1];
+    m = /youtu\.be\/([A-Za-z0-9_-]{6,})/.exec(url);
+    if (m) return m[1];
+    m = /youtube\.com\/(?:shorts|embed|live)\/([A-Za-z0-9_-]{6,})/.exec(url);
+    if (m) return m[1];
+    return "";
+  }
+
+  function cardKey(item) {
+    var u = item && typeof item.url === "string" ? item.url.trim() : "";
+    if (!u) return "";
+    return videoId(u) || u;
+  }
+
+  // ---------- 日付(日本時間) ----------
+  function jstDay(date) {
+    var d = new Date((date || new Date()).getTime() + 9 * 3600 * 1000);
+    var mm = d.getUTCMonth() + 1, dd = d.getUTCDate();
+    return d.getUTCFullYear() + "-" + (mm < 10 ? "0" : "") + mm + "-" + (dd < 10 ? "0" : "") + dd;
+  }
+
+  function dailyState(count, cap, round) {
+    cap = cap || DAILY_CAP; round = round || ROUND;
+    var c = Math.max(0, Number(count) || 0);
+    var remaining = Math.max(0, cap - c);
+    return { count: c, cap: cap, remaining: remaining, size: Math.min(round, remaining),
+             roundsLeft: Math.ceil(remaining / round) };
+  }
+
+  // ---------- 出題 ----------
+  function shuffle(arr, rng) {
+    var a = arr.slice();
+    for (var i = a.length - 1; i > 0; i--) {
+      var j = Math.floor(rng() * (i + 1));
+      var t = a[i]; a[i] = a[j]; a[j] = t;
+    }
+    return a;
+  }
+
+  // カテゴリが偏らないよう、カテゴリごとにシャッフルして順番に1件ずつ取り出す並びにする
+  function spreadByCategory(list, rng) {
+    var groups = {}, order = [];
+    for (var i = 0; i < list.length; i++) {
+      var c = list[i].category || "";
+      if (!groups[c]) { groups[c] = []; order.push(c); }
+      groups[c].push(list[i]);
+    }
+    order = shuffle(order, rng);
+    for (var k = 0; k < order.length; k++) groups[order[k]] = shuffle(groups[order[k]], rng);
+    var out = [], more = true, idx = 0;
+    while (more) {
+      more = false;
+      for (var g = 0; g < order.length; g++) {
+        var grp = groups[order[g]];
+        if (idx < grp.length) { out.push(grp[idx]); more = true; }
+      }
+      idx++;
+    }
+    return out;
+  }
+
+  function scaledQuota(n) {
+    var total = 0, k, q = {};
+    for (k in QUOTA) total += QUOTA[k];
+    var used = 0, levels = [5, 4, 3, 2, 1];
+    for (var i = 0; i < levels.length; i++) {
+      q[levels[i]] = Math.floor(QUOTA[levels[i]] * n / total);
+      used += q[levels[i]];
+    }
+    for (var j = 0; used < n; j = (j + 1) % levels.length) { q[levels[j]]++; used++; }
+    return q;
+  }
+
+  /**
+   * pool: まだ答えていないカード [{key, category, s(AI点1〜5), ref}]。
+   * opts: {n=20, rng=Math.random, repeatPool=[{key, ref, category, s}] (2日以上前に答えたカード)}
+   * 戻り値: [{key, category, s, ref, stratum:'s4', inclusion_p, is_repeat}]  表示順は混ぜてある(AI点順にならない)。
+   */
+  function pickBatch(pool, opts) {
+    opts = opts || {};
+    var n = opts.n || ROUND;
+    var rng = opts.rng || Math.random;
+    var repeat = opts.repeatPool || [];
+    var wantRepeat = repeat.length > 0 && n >= 5;
+    var nNew = wantRepeat ? n - 1 : n;
+
+    var byS = { 1: [], 2: [], 3: [], 4: [], 5: [] };
+    var seen = {};
+    for (var i = 0; i < pool.length; i++) {
+      var c = pool[i];
+      if (!c || !c.key || seen[c.key] || !byS[c.s]) continue;
+      seen[c.key] = 1;
+      byS[c.s].push(c);
+    }
+    var size = {}, lists = {}, lv;
+    for (lv = 1; lv <= 5; lv++) { size[lv] = byS[lv].length; lists[lv] = spreadByCategory(byS[lv], rng); }
+    var quota = scaledQuota(nNew), picked = { 1: [], 2: [], 3: [], 4: [], 5: [] }, taken = 0;
+    for (lv = 5; lv >= 1; lv--) {
+      var take = Math.min(quota[lv], lists[lv].length);
+      picked[lv] = lists[lv].slice(0, take);
+      lists[lv] = lists[lv].slice(take);
+      taken += take;
+    }
+    while (taken < nNew) {            // 足りない層の分は、残りの多い層から補う
+      var best = 0, bestLen = 0;
+      for (lv = 1; lv <= 5; lv++) if (lists[lv].length > bestLen) { best = lv; bestLen = lists[lv].length; }
+      if (!best) break;
+      picked[best].push(lists[best].shift());
+      taken++;
+    }
+    var out = [];
+    for (lv = 1; lv <= 5; lv++) {
+      for (var k = 0; k < picked[lv].length; k++) {
+        var p = picked[lv][k];
+        out.push({ key: p.key, category: p.category, s: p.s, ref: p.ref, stratum: "s" + lv,
+                   inclusion_p: Math.round(1000000 * picked[lv].length / size[lv]) / 1000000, is_repeat: false });
+      }
+    }
+    if (wantRepeat) {
+      var r = repeat[Math.floor(rng() * repeat.length)];
+      out.push({ key: r.key, category: r.category, s: r.s, ref: r.ref, stratum: "repeat", inclusion_p: null, is_repeat: true });
+    }
+    return shuffle(out, rng);
+  }
+
+  // ---------- 送信する行 ----------
+  function buildRow(card, label, meta) {
+    meta = meta || {};
+    var item = (card && card.ref) || {};
+    var ai = item.ai && typeof item.ai.s === "number" ? item.ai.s : (typeof card.s === "number" ? card.s : null);
+    var ch = typeof item.channel === "string" ? item.channel.replace(/\s*[\(（]登録者数[^)）]*[\)）]\s*$/, "").trim() : null;
+    return {
+      card_key: card.key, channel: ch ? ch.slice(0, 200) : null, category: card.category ? String(card.category).slice(0, 20) : null,
+      label_score: label, ai_score: ai,
+      rss_judge: typeof item.rss_judge === "number" ? item.rss_judge : null,
+      inclusion_p: card.inclusion_p, is_repeat: !!card.is_repeat,
+      stratum: card.stratum ? String(card.stratum).slice(0, 40) : null,
+      device: meta.device ? String(meta.device).slice(0, 40) : null
+    };
+  }
+
+  // ---------- 再生中のカードへの 👍👎(盲検ではない。表示している点を1つ上げ下げした点として記録する) ----------
+  var FEEDBACK_TABLE = "yt_feedback";
+  var FEEDBACK_QUEUE_KEY = "ytFeedbackQueue";
+
+  function clampScore(n) { return Math.max(1, Math.min(5, n)); }
+
+  /** shown: いま表示している点(1〜5)。dir: 'up' | 'down'。戻り値: 記録する点(1〜5)。 */
+  function thumbRating(shown, dir) {
+    var s = Number(shown);
+    if (!(s >= 1 && s <= 5)) return null;
+    s = Math.round(s);
+    return clampScore(dir === "up" ? s + 1 : s - 1);
+  }
+
+  /**
+   * item: カード(item.ai に点が付いている)。meta: {device, category}。
+   * ai_score は元のAIの点(item.ai.s。補正がオンでも ai.s は変わらない)、shown_score は押した時点で画面に出ていた点
+   * (補正がオンなら補正後の点 item.ai.cs、オフなら ai.s)。記録する点(rating)は、shown_score を1つ上げ下げした点。
+   * 点が無いカード・向きが不正なときは null。
+   */
+  function buildFeedbackRow(item, dir, meta) {
+    meta = meta || {};
+    var key = cardKey(item);
+    var ai = item && item.ai;
+    if (!key || !ai || typeof ai.s !== "number") return null;
+    if (dir !== "up" && dir !== "down") return null;
+    var shown = typeof ai.cs === "number" ? ai.cs : ai.s;
+    var rating = thumbRating(shown, dir);
+    if (rating === null) return null;
+    var raw = ai.s;
+    var ch = typeof item.channel === "string" ? item.channel.replace(/\s*[\(（]登録者数[^)）]*[\)）]\s*$/, "").trim() : null;
+    return {
+      card_key: key, channel: ch ? ch.slice(0, 200) : null,
+      category: meta.category ? String(meta.category).slice(0, 20) : null,
+      interest: typeof ai.i === "string" && ai.i ? ai.i.slice(0, 20) : null,
+      ai_score: clampScore(Math.round(raw)), shown_score: clampScore(Math.round(shown)),
+      rating: rating, direction: dir,
+      device: meta.device ? String(meta.device).slice(0, 40) : null
+    };
+  }
+
+  function createFeedbackClient(cfg) {
+    var c = {}, k;
+    for (k in (cfg || {})) c[k] = cfg[k];
+    c.table = FEEDBACK_TABLE; c.queueKey = FEEDBACK_QUEUE_KEY;
+    return createClient(c);
+  }
+
+  // ---------- 読み上げ辞書(yt_tts_dict): 追加のみ・合言葉つき。送れなかった分の再送は、辞書の置き場(tts_user_dict.js)が受け持つ ----------
+  var TTS_DICT_TABLE = "yt_tts_dict";
+
+  function createTtsDictClient(cfg) {
+    var c = {}, k;
+    for (k in (cfg || {})) c[k] = cfg[k];
+    c.table = TTS_DICT_TABLE; c.queueKey = "ytTtsDictQueue"; c.storage = null;     // 端末への溜め込みは、辞書の置き場が行う(二重にしない)
+    return createClient(c);
+  }
+
+  // ---------- Supabase REST ----------
+  function createClient(cfg) {
+    cfg = cfg || {};
+    var base = String(cfg.url || "").replace(/\/+$/, "") + "/rest/v1/" + (cfg.table || "yt_labels");
+    var queueKey = cfg.queueKey || QUEUE_KEY;
+    var fetchFn = cfg.fetchFn || (typeof fetch === "function" ? function (u, o) { return fetch(u, o); } : null);
+    var storage = cfg.storage || null;
+    var getKey = cfg.getKey || function () { return ""; };     // 書き込み用の合言葉
+    var headers = { apikey: cfg.anonKey, Authorization: "Bearer " + cfg.anonKey };
+
+    function h(extra) {
+      var o = {}, k;
+      for (k in headers) o[k] = headers[k];
+      for (k in (extra || {})) o[k] = extra[k];
+      return o;
+    }
+    function readQueue() {
+      try { var q = JSON.parse(storage.getItem(queueKey) || "[]"); return Array.isArray(q) ? q : []; } catch (e) { return []; }
+    }
+    function writeQueue(q) {
+      try { storage.setItem(queueKey, JSON.stringify(q)); } catch (e) { /* 保存できなくても続ける */ }
+    }
+
+    /** 今日のラベル数(サーバー)。失敗したら reject。 */
+    function countToday(day) {
+      return fetchFn(base + "?select=id&label_day=eq." + encodeURIComponent(day || jstDay()),
+        { method: "GET", headers: h({ Prefer: "count=exact", Range: "0-0" }) }).then(function (res) {
+        if (!res.ok && res.status !== 206) throw new Error("count " + res.status);
+        var m = /\/(\d+)\s*$/.exec(res.headers.get("content-range") || "");
+        if (!m) throw new Error("count: no range");
+        return parseInt(m[1], 10);
+      });
+    }
+
+    /** 答え済みのカード [{card_key, labeled_at, is_repeat}]。 */
+    function listLabeled() {
+      var out = [];
+      function page(from) {
+        return fetchFn(base + "?select=card_key,labeled_at,is_repeat&order=id.asc",
+          { method: "GET", headers: h({ Range: from + "-" + (from + 999) }) }).then(function (res) {
+          if (!res.ok && res.status !== 206) throw new Error("list " + res.status);
+          return res.json().then(function (rows) {
+            for (var i = 0; i < rows.length; i++) out.push(rows[i]);
+            if (rows.length === 1000 && out.length < LISTED_MAX) return page(from + 1000);
+            return out;
+          });
+        });
+      }
+      return page(0);
+    }
+
+    /** 表の全行(古い順)を読む。select 例: "id,word,reading"(読み上げ辞書 yt_tts_dict 用)。失敗したら reject。 */
+    function listRows(select) {
+      var out = [];
+      var sel = String(select || "id").replace(/[^A-Za-z0-9_,]/g, "");
+      function page(from) {
+        return fetchFn(base + "?select=" + sel + "&order=id.asc",
+          { method: "GET", headers: h({ Range: from + "-" + (from + 999) }) }).then(function (res) {
+          if (!res.ok && res.status !== 206) throw new Error("rows " + res.status);
+          return res.json().then(function (rows) {
+            for (var i = 0; i < rows.length; i++) out.push(rows[i]);
+            if (rows.length === 1000 && out.length < LISTED_MAX) return page(from + 1000);
+            return out;
+          });
+        });
+      }
+      return page(0);
+    }
+
+    /** 1行を送る。'ok' | 'duplicate'(409。送れたものとして扱う) | 'rejected'(400など。再送しても通らないので捨てる)。
+     *  合言葉が無い・違うとき(401/403)は {denied:true} を投げる。それ以外(通信失敗・5xx・429)は通常の例外。 */
+    function insertOne(row) {
+      var key = String(getKey() || "");
+      if (!key) return Promise.reject({ denied: true });
+      var body = {}, k;
+      for (k in row) body[k] = row[k];
+      body.k = key;
+      return fetchFn(base, { method: "POST", headers: h({ "Content-Type": "application/json", Prefer: "return=minimal" }),
+                             body: JSON.stringify(body) }).then(function (res) {
+        if (res.ok) return "ok";
+        if (res.status === 409) return "duplicate";
+        if (res.status === 401 || res.status === 403) throw { denied: true };
+        if (res.status === 400 || res.status === 404 || res.status === 422) return "rejected";
+        throw new Error("insert " + res.status);
+      });
+    }
+
+    /** 答えを送る。戻り値: 'sent' | 'queued'(端末に溜めた) | 'rejected'(捨てた) | 'denied'(合言葉が無い/違う。溜めない)。 */
+    function submit(row) {
+      return insertOne(row).then(function (r) { return r === "rejected" ? "rejected" : "sent"; }, function (err) {
+        if (err && err.denied) return "denied";
+        var q = readQueue(); q.push(row); writeQueue(q);
+        return "queued";
+      });
+    }
+
+    /** 溜めた分を順に再送する。戻り値: 残り件数。合言葉が違う/通信失敗のとき、そこで止めて残りは次回。 */
+    function flush() {
+      var q = readQueue();
+      if (!q.length) return Promise.resolve(0);
+      var left = [];
+      var chain = Promise.resolve();
+      q.forEach(function (row) {
+        chain = chain.then(function () {
+          if (left.length) { left.push(row); return null; }       // 1件止まったら、順序を保ったまま残りは次回
+          return insertOne(row).then(null, function () { left.push(row); });
+        });
+      });
+      return chain.then(function () { writeQueue(left); return left.length; });
+    }
+
+    function pendingKeys() {
+      var o = {}, q = readQueue();
+      for (var i = 0; i < q.length; i++) if (q[i] && q[i].card_key) o[q[i].card_key] = 1;
+      return o;
+    }
+
+    return { countToday: countToday, listLabeled: listLabeled, listRows: listRows, submit: submit, flush: flush, pendingKeys: pendingKeys,
+             pending: function () { return readQueue().length; } };
+  }
+
+  return {
+    ROUND: ROUND, DAILY_CAP: DAILY_CAP, QUOTA: QUOTA, REPEAT_MIN_DAYS: REPEAT_MIN_DAYS,
+    videoId: videoId, cardKey: cardKey, jstDay: jstDay, dailyState: dailyState,
+    pickBatch: pickBatch, buildRow: buildRow, createClient: createClient,
+    thumbRating: thumbRating, buildFeedbackRow: buildFeedbackRow, createFeedbackClient: createFeedbackClient,
+    FEEDBACK_TABLE: FEEDBACK_TABLE, FEEDBACK_QUEUE_KEY: FEEDBACK_QUEUE_KEY,
+    createTtsDictClient: createTtsDictClient, TTS_DICT_TABLE: TTS_DICT_TABLE
+  };
+});
+</script>
+<script>/*
+ * beta_listen.js - 新UI(beta)の聴くモードの計算部分(3-2 深さの言葉化、3-1 の読む順・15分の区切り)。
+ * 依存なし・独立(beta.html に埋め込む / node でテストする)。深さの自動判定は ListenDepth(listen_depth.js)を渡して使う。
+ *
+ * 深さの呼び名(モックアップv4で決定): 題名 / 要旨 / ＋結論 / 全部。ListenDepth の深さ番号(4/3/2/1)に対応する。
+ *   題名 = 題名だけ(4)  要旨 = 題名＋要旨(3)  ＋結論 = 要旨＋結論(2)  全部 = 結論＋主なポイントまで(1)
+ *
+ * 古いiOS Safariで構文エラーになる記法(アロー関数・let/const・?.・??・replaceAll・後読み)は使わない。
+ */
+(function (root, factory) {
+  var api = factory();
+  if (typeof module === "object" && module && module.exports) module.exports = api;
+  else root.YMListen = api;
+})(typeof self !== "undefined" ? self : this, function () {
+  "use strict";
+
+  // UIの並び順(浅い→深い)。depth は ListenDepth の深さ番号。
+  var DEPTHS = [
+    { key: "title", name: "題名", depth: 4 },
+    { key: "summary", name: "要旨", depth: 3 },
+    { key: "conclusion", name: "＋結論", depth: 2 },
+    { key: "all", name: "全部", depth: 1 }
+  ];
+
+  // 読み上げの速さの見積もり: 1倍速で毎秒6.5文字(仮の値。実機で測って直す)。部分の切れ目ごとに約0.7秒の間。
+  var CHARS_PER_SEC = 6.5;
+  var PART_PAUSE_SEC = 0.7;
+  var LIMIT_SEC = 15 * 60;
+
+  function byDepth(depth) {
+    for (var i = 0; i < DEPTHS.length; i++) if (DEPTHS[i].depth === depth) return DEPTHS[i];
+    return DEPTHS[1];
+  }
+  function byKey(key) {
+    for (var i = 0; i < DEPTHS.length; i++) if (DEPTHS[i].key === key) return DEPTHS[i];
+    return null;
+  }
+
+  function stripHtml(s) {
+    return String(s || "").replace(/<[^>]*>/g, " ").replace(/&nbsp;/g, " ").replace(/&amp;/g, "&")
+      .replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&quot;/g, "\"").replace(/&#39;/g, "'")
+      .replace(/\s+/g, " ").replace(/^\s+|\s+$/g, "");
+  }
+
+  // 深さ(4/3/2/1)ごとに読む部分の一覧。[{part, text}]。無い部分は入れない。
+  function parts(item, depth, pos) {
+    item = item || {};
+    var out = [];
+    var title = stripHtml(item.title);
+    out.push({ part: "title", text: (pos ? pos + "番。 " : "") + title });
+    if (depth <= 3 && item.summary) out.push({ part: "summary", text: stripHtml(item.summary) });
+    if (depth <= 2 && item.conclusion) out.push({ part: "conclusion", text: "結論。 " + stripHtml(item.conclusion) });
+    if (depth <= 1 && item.points) {
+      var pt = stripHtml(item.points);
+      if (pt) out.push({ part: "points", text: "主なポイント。 " + pt });
+    }
+    return out;
+  }
+
+  function estimateSec(item, depth, rate) {
+    var ps = parts(item, depth, 0), n = 0;
+    for (var i = 0; i < ps.length; i++) n += ps[i].text.length;
+    var r = (typeof rate === "number" && rate > 0) ? rate : 1;
+    return n / (CHARS_PER_SEC * r) + ps.length * PART_PAUSE_SEC;
+  }
+
+  function minutesLabel(sec) {
+    var m = Math.max(1, Math.ceil(sec / 60));
+    return "約" + m + "分";
+  }
+
+  // 1枚ぶんの長さの言い方。1分未満は「約N秒」(5秒刻み)、それ以上は「約N分」。
+  function durLabel(sec) {
+    if (sec < 60) return "約" + Math.max(5, Math.round(sec / 5) * 5) + "秒";
+    return "約" + Math.ceil(sec / 60) + "分";
+  }
+
+  // そのカードを、各深さで聴いたときの長さ。[{key, name, depth, sec, label}]
+  function perDepth(item, rate) {
+    var out = [], i;
+    for (i = 0; i < DEPTHS.length; i++) {
+      var s = estimateSec(item, DEPTHS[i].depth, rate);
+      out.push({ key: DEPTHS[i].key, name: DEPTHS[i].name, depth: DEPTHS[i].depth, sec: s, label: durLabel(s) });
+    }
+    return out;
+  }
+
+  // 深さ自動。ListenDepth.decide と同じ材料を、カードとサマリーから集める。
+  // 戻り値 {depth, key, name, why}。ListenDepth が無い・失敗したときは要旨。
+  function autoDepth(listenDepth, item, category) {
+    item = item || {};
+    var d = null;
+    try {
+      d = listenDepth.decide({
+        category: category || "", type: item.type, duration: item.duration,
+        aiScore: (item.ai && typeof item.ai.s === "number") ? item.ai.s : null,
+        rssJudge: (typeof item.rss_judge === "number") ? item.rss_judge : null,
+        starred: item.is_favorite === true || item.category === "Followed Note"
+      });
+    } catch (e) { d = null; }
+    var depth = d ? d.depth : 3;
+    var b = byDepth(depth);
+    return { depth: depth, key: b.key, name: b.name, why: d ? d.why : "材料なし(標準)" };
+  }
+
+  function isStarred(item) {
+    return !!item && (item.is_favorite === true || item.category === "Followed Note");
+  }
+
+  // サマリーの新しさ: ファイル名の _YYYYMMDD_HHMMSS。無ければ0。
+  function fileStamp(filename) {
+    var m = /_(\d{8})_(\d{6})/.exec(filename || "");
+    return m ? Number(m[1] + m[2]) : 0;
+  }
+
+  function scoreOf(item) {
+    return (item && item.ai && typeof item.ai.s === "number") ? item.ai.s : 0;
+  }
+
+  // 読む順。order: "score"(点数の高い順・★は先頭・サマリーをまたぐ) | "newest"(サマリーごと・新しい順) | "oldest"(古い順)
+  // cards: [{filename, iIdx, item, key, category}]。元の配列は変えない。
+  function sortCards(cards, order) {
+    var arr = [], i;
+    for (i = 0; i < cards.length; i++) arr.push({ c: cards[i], n: i });
+    arr.sort(function (a, b) {
+      var x = a.c, y = b.c, d;
+      if (order === "score") {
+        d = (isStarred(y.item) ? 1 : 0) - (isStarred(x.item) ? 1 : 0);
+        if (d) return d;
+        d = scoreOf(y.item) - scoreOf(x.item);
+        if (d) return d;
+        d = fileStamp(y.filename) - fileStamp(x.filename);
+        if (d) return d;
+      } else {
+        d = fileStamp(y.filename) - fileStamp(x.filename);
+        if (order === "oldest") d = -d;
+        if (d) return d;
+        if (x.filename !== y.filename) return x.filename < y.filename ? -1 : 1;
+      }
+      d = x.iIdx - y.iIdx;
+      return d || (a.n - b.n);
+    });
+    var out = [];
+    for (i = 0; i < arr.length; i++) out.push(arr[i].c);
+    return out;
+  }
+
+  // 聴く計画。
+  // opts: {order, limitSec, rate, listenDepth, isRead(card)->bool, checkedFiles{filename:bool}, skipKeys{key:true}}
+  // 戻り値: {session:[{card, depth, key, name, why, sec}], sec, total, rest}
+  //   session = 今回の15分ぶん(最低1件)。total = 対象の未読の件数。rest = 今回に入らなかった件数。
+  function plan(cards, opts) {
+    opts = opts || {};
+    var limit = typeof opts.limitSec === "number" ? opts.limitSec : LIMIT_SEC;
+    var checked = opts.checkedFiles || {};
+    var skip = opts.skipKeys || {};
+    var pool = [], i;
+    for (i = 0; i < cards.length; i++) {
+      var c = cards[i];
+      if (!c || !c.item || c.item.is_error) continue;
+      if (checked[c.filename] === false) continue;
+      if (skip[c.key]) continue;
+      if (opts.isRead && opts.isRead(c)) continue;
+      pool.push(c);
+    }
+    var ordered = sortCards(pool, opts.order || "score");
+    var session = [], sec = 0;
+    for (i = 0; i < ordered.length; i++) {
+      var a = autoDepth(opts.listenDepth, ordered[i].item, ordered[i].category);
+      var s = estimateSec(ordered[i].item, a.depth, opts.rate);
+      if (session.length > 0 && sec + s > limit) break;
+      session.push({ card: ordered[i], depth: a.depth, key: a.key, name: a.name, why: a.why, sec: s });
+      sec += s;
+    }
+    return { session: session, sec: sec, total: ordered.length, rest: ordered.length - session.length };
+  }
+
+  return {
+    DEPTHS: DEPTHS, LIMIT_SEC: LIMIT_SEC, CHARS_PER_SEC: CHARS_PER_SEC,
+    byDepth: byDepth, byKey: byKey, stripHtml: stripHtml, parts: parts, estimateSec: estimateSec,
+    minutesLabel: minutesLabel, durLabel: durLabel, perDepth: perDepth, autoDepth: autoDepth, sortCards: sortCards, plan: plan, fileStamp: fileStamp
+  };
+});
+</script>
+<script>/*
+ * beta_player.js - 新UI(beta)の読み上げ本体。依存なし・独立(beta.html に埋め込む / node で偽の読み上げ器を渡してテストする)。
+ *
+ * 聴く計画(YMListen.plan の session)を先頭から順に読む。1枚のカードは、選んだ深さの分だけ
+ * 題名→要旨→結論→主なポイントの順に、部分ごとに1つずつ話す。
+ * 読み終えたカードも「次」で飛ばしたカードも、onCardEnd(entry, how) で知らせる(how = "end" | "skip")。呼び出し側が既読にする。
+ *
+ * iOS Safari の癖への備え(旧UIと同じ):
+ *   - onend が重複して届くことがあるので、1つの発話につき1回だけ受ける。
+ *   - 止めた・飛ばした後に古い発話の onend が届いても無視する(世代番号 gen)。
+ *   - 部分の切れ目は 10ms 空けて次を話す(同じ呼び出しの中で続けて speak しない)。
+ *
+ * 古いiOS Safariで構文エラーになる記法(アロー関数・let/const・?.・??・replaceAll・後読み)は使わない。
+ */
+(function (root, factory) {
+  var api = factory();
+  if (typeof module === "object" && module && module.exports) module.exports = api;
+  else root.YMPlayer = api;
+})(typeof self !== "undefined" ? self : this, function () {
+  "use strict";
+
+  var GAP_MS = 10;
+
+  /*
+   * o:
+   *   items       [{card, depth, key, name, why}]  YMListen.plan の session
+   *   listen      YMListen
+   *   synth       speechSynthesis 相当 {speak, cancel}
+   *   newUtterance(text) -> 発話オブジェクト {rate, onend, onerror, ...}
+   *   voice(ut)   声を選ぶ(省略可)
+   *   prep(text)  読み上げ前の整形(省略可)。話す文を返す
+   *   rate        速さ(省略時 1)
+   *   bg          {start(), stopSoon()} 背景再生の保持(省略可)
+   *   onChange(state)  状態が変わるたび
+   *   onCardEnd(entry, how)
+   *   onFinish()  最後のカードまで終えたとき
+   *   setTimer / clearTimer  テスト用の差し替え
+   */
+  function create(o) {
+    var items = o.items || [];
+    var listen = o.listen;
+    var setT = o.setTimer || function (f, ms) { return setTimeout(f, ms); };
+    var clearT = o.clearTimer || function (t) { clearTimeout(t); };
+    var st = { i: 0, p: 0, playing: false, depthKey: null, pinKey: null, rate: (typeof o.rate === "number" && o.rate > 0) ? o.rate : 1, finished: false };
+    var gen = 0, timer = null, cur = null, dead = false;
+
+    function entry() { return items[st.i] || null; }
+
+    // 深さ: このカードだけ手で選んだ > 📌ずっと > 自動。カードが変わると「このカードだけ」は自動(または📌)に戻る。
+    function depthOf(e) {
+      var d = null;
+      if (st.depthKey) d = listen.byKey(st.depthKey);
+      if (!d && st.pinKey) d = listen.byKey(st.pinKey);
+      return d || listen.byDepth(e.depth);
+    }
+
+    function remainingSec() {
+      var sum = 0, k;
+      for (k = st.i; k < items.length; k++) sum += listen.estimateSec(items[k].card.item, depthOf(items[k]).depth, st.rate);
+      return sum;
+    }
+
+    function partsFor(e) {
+      return listen.parts(e.card.item, depthOf(e).depth, st.i + 1);
+    }
+
+    function state() {
+      var e = entry();
+      return {
+        i: st.i, p: st.p, total: items.length, playing: st.playing, finished: st.finished,
+        rate: st.rate, depthKey: st.depthKey, pinKey: st.pinKey, remainingSec: remainingSec(), entry: e,
+        depthName: e ? depthOf(e).name : "", auto: !st.depthKey,
+        part: e ? (partsFor(e)[st.p] || null) : null
+      };
+    }
+
+    function emit() { if (o.onChange) { try { o.onChange(state()); } catch (e) { } } }
+
+    function killCurrent() {
+      gen++;
+      if (timer) { clearT(timer); timer = null; }
+      if (cur) { cur.onend = null; cur.onerror = null; cur = null; }
+      try { o.synth.cancel(); } catch (e) { }
+    }
+
+    function finishAll() {
+      st.playing = false; st.finished = true;
+      if (o.bg) o.bg.stopSoon();
+      emit();
+      if (o.onFinish) o.onFinish();
+    }
+
+    // 今のカードを閉じて次へ。how: "end"(読み終えた) | "skip"(次で飛ばした)
+    function leaveCard(how) {
+      var e = entry();
+      if (e && o.onCardEnd) { try { o.onCardEnd(e, how); } catch (err) { } }
+      st.i++; st.p = 0; st.depthKey = null;
+      if (st.i >= items.length) { st.i = items.length; finishAll(); return false; }
+      return true;
+    }
+
+    function speak() {
+      if (!st.playing) return;
+      var e = entry();
+      if (!e) { finishAll(); return; }
+      var ps = partsFor(e);
+      if (st.p >= ps.length) {
+        if (leaveCard("end")) { emit(); schedule(); }
+        return;
+      }
+      var text = ps[st.p].text;
+      try { if (o.prep) text = o.prep(text) || text; } catch (err) { }
+      var ut = o.newUtterance(text);
+      ut.rate = st.rate;
+      if (o.voice) { try { o.voice(ut); } catch (err) { } }
+      var myGen = ++gen, handled = false;
+      function done() {
+        if (handled || myGen !== gen || !st.playing) return;
+        handled = true; cur = null;
+        st.p++;
+        emit();
+        schedule();
+      }
+      // 読み上げのエラーは「読み終えた」ではない。止めて知らせる(カードを進めず、既読にもしない)。
+      // 止めたときの cancel で出る interrupted / canceled は、エラーではないので無視する。
+      function fail(reason) {
+        if (handled || myGen !== gen || !st.playing) return;
+        handled = true;
+        st.playing = false;
+        killCurrent();
+        if (o.bg) o.bg.stopSoon();
+        emit();
+        if (o.onError) { try { o.onError(reason); } catch (err2) { } }
+      }
+      ut.onend = done;
+      ut.onerror = function (ev) {
+        var er = ev && ev.error ? String(ev.error) : "";
+        if (er === "interrupted" || er === "canceled") return;
+        fail(er || "error");
+      };
+      cur = ut;
+      emit();
+      try { o.synth.speak(ut); } catch (err) { fail("speak"); }
+    }
+
+    function schedule() {
+      if (timer) clearT(timer);
+      timer = setT(function () { timer = null; speak(); }, GAP_MS);
+    }
+
+    var api = {
+      state: state,
+      play: function () {
+        if (dead || st.finished || !items.length) return;
+        st.playing = true;
+        if (o.bg) o.bg.start();
+        killCurrent();
+        emit();
+        schedule();
+      },
+      pause: function () {
+        if (dead || !st.playing) return;
+        st.playing = false;
+        killCurrent();
+        if (o.bg) o.bg.stopSoon();
+        emit();
+      },
+      // 次のカードへ。読んでいた分は「飛ばした」として知らせる。
+      next: function () {
+        if (dead || st.finished || !entry()) return;
+        killCurrent();
+        var more = leaveCard("skip");
+        if (!more) return;
+        emit();
+        if (st.playing) schedule();
+      },
+      // 今のカードの頭へ。すでに頭なら前のカードへ。既読は取り消さない。
+      prev: function () {
+        if (dead || st.finished) return;
+        killCurrent();
+        if (st.p > 0) st.p = 0;
+        else if (st.i > 0) { st.i--; st.p = 0; st.depthKey = null; }
+        emit();
+        if (st.playing) schedule();
+      },
+      // 深さを、このカードだけ手で決める。null で自動(または📌)に戻す。話している部分は止めず、次の部分から効く。
+      setDepth: function (key) { st.depthKey = key || null; emit(); },
+      // 📌 ずっとこの深さにする。null で外す。
+      setPin: function (key) { st.pinKey = key || null; emit(); },
+      setRate: function (r) { if (typeof r === "number" && r > 0) { st.rate = r; emit(); } },
+      destroy: function () { dead = true; st.playing = false; killCurrent(); }
+    };
+    return api;
+  }
+
+  return { create: create, GAP_MS: GAP_MS };
+});
+</script>
+<script>/*
+ * beta_ui.js - 新UI(beta.html)の部品。依存なし・独立(beta.html に埋め込む / node でテストする)。
+ *
+ * 1-1: beta.html は薄い殻。同じオリジンの index.html を fetch し、
+ *      「// YM_BETA_DATA_BEGIN」〜「// YM_BETA_DATA_END」の間(ALL_DATA と DASHBOARD_DATA の宣言)だけ取り出して使う。
+ * 1-2: 既読はカードのURLキー(動画idまたはURL)で覚える。保存先は localStorage の summaryManagerReadV2。
+ *      旧UIの summaryManagerState.readHistory(`${filename}_${iIdx}`)は読むだけで、書き換えない(旧→新の一方向)。
+ *
+ * 古いiOS Safariで構文エラーになる記法(アロー関数・let/const・?.・??・replaceAll・後読み)は使わない。
+ */
+(function (root, factory) {
+  var api = factory();
+  if (typeof module === "object" && module && module.exports) module.exports = api;
+  else root.YMBeta = api;
+})(typeof self !== "undefined" ? self : this, function () {
+  "use strict";
+
+  var READ_V2_KEY = "summaryManagerReadV2";
+  var OLD_STATE_KEY = "summaryManagerState";
+  var DATA_BEGIN = "// YM_BETA_DATA_BEGIN";
+  var DATA_END = "// YM_BETA_DATA_END";
+
+  // Python側 summary_analysis.video_id_of と同じ: URLの ?v= の値。無ければURLそのもの。
+  function videoIdOf(url) {
+    var m = /[?&]v=([^&#]*)/.exec(url || "");
+    if (!m) return "";
+    try { return decodeURIComponent(m[1]); } catch (e) { return m[1]; }
+  }
+
+  // カードの身元キー。urlがあれば 動画id か URL、無ければ位置で代用(p:ファイル名_位置)。
+  function cardKey(item, filename, iIdx) {
+    var u = (item && item.url) || "";
+    if (u) return videoIdOf(u) || u;
+    return "p:" + filename + "_" + iIdx;
+  }
+
+  function isObj(x) { return x && typeof x === "object"; }
+
+  // 旧readHistoryのキー `ファイル名_位置` → [ファイル名, 位置]。ファイル名は下線を含むので最後の下線で切る。
+  function splitOldKey(k) {
+    var p = k.lastIndexOf("_");
+    if (p <= 0) return null;
+    var idx = Number(k.slice(p + 1));
+    if (!isFinite(idx) || Math.floor(idx) !== idx || idx < 0) return null;
+    return [k.slice(0, p), idx];
+  }
+
+  function findFile(allData, filename) {
+    for (var i = 0; i < allData.length; i++) if (allData[i] && allData[i].filename === filename) return allData[i];
+    return null;
+  }
+
+  // 旧の既読(readHistory)をV2へ追加する。read は {キー: 時刻} で、渡したものを変更せず新しいものを返す。
+  // 戻り値 {read, added, unresolved}。unresolved は現在のALL_DATAに存在しないカード(古いサマリーが消えた等)の件数。
+  function migrateOld(readV2, readHistory, allData, now) {
+    var out = {}, k, added = 0, unresolved = 0;
+    for (k in (readV2 || {})) if (Object.prototype.hasOwnProperty.call(readV2, k)) out[k] = readV2[k];
+    for (k in (readHistory || {})) {
+      if (!Object.prototype.hasOwnProperty.call(readHistory, k) || !readHistory[k]) continue;
+      var sp = splitOldKey(k);
+      var f = sp && findFile(allData || [], sp[0]);
+      var item = f && f.items && f.items[sp[1]];
+      if (!item) { unresolved++; continue; }
+      var key = cardKey(item, sp[0], sp[1]);
+      if (!out[key]) { out[key] = now || 1; added++; }
+    }
+    return { read: out, added: added, unresolved: unresolved };
+  }
+
+  function isRead(readV2, item, filename, iIdx) {
+    return !!(readV2 && readV2[cardKey(item, filename, iIdx)]);
+  }
+
+  // 書き出し v2: {"v":2,"read":[キー,...]}
+  function buildExport(readV2) {
+    var keys = [];
+    for (var k in (readV2 || {})) if (Object.prototype.hasOwnProperty.call(readV2, k) && readV2[k]) keys.push(k);
+    return JSON.stringify({ v: 2, read: keys });
+  }
+
+  // 取り込み。v1({"v":1,"read":{ファイル名:[位置]}})とv2の両方を受ける。追加のみ。
+  // 戻り値 {read, added, unresolved} か、形式が不正なら null。
+  function importRead(readV2, text, allData, now) {
+    var obj;
+    try { obj = JSON.parse(String(text).trim()); } catch (e) { return null; }
+    if (!isObj(obj) || !obj.read) return null;
+    var out = {}, k, added = 0, unresolved = 0;
+    for (k in (readV2 || {})) if (Object.prototype.hasOwnProperty.call(readV2, k)) out[k] = readV2[k];
+    if (obj.v === 2 && Object.prototype.toString.call(obj.read) === "[object Array]") {
+      for (var i = 0; i < obj.read.length; i++) {
+        var key = obj.read[i];
+        if (typeof key !== "string" || !key) continue;
+        if (!out[key]) { out[key] = now || 1; added++; }
+      }
+      return { read: out, added: added, unresolved: 0 };
+    }
+    if (isObj(obj.read) && Object.prototype.toString.call(obj.read) !== "[object Array]") {
+      var old = {};
+      for (var fn in obj.read) {
+        if (!Object.prototype.hasOwnProperty.call(obj.read, fn)) continue;
+        var idxs = obj.read[fn];
+        if (Object.prototype.toString.call(idxs) !== "[object Array]") continue;
+        for (var j = 0; j < idxs.length; j++) old[fn + "_" + idxs[j]] = true;
+      }
+      var m = migrateOld(out, old, allData, now);
+      return m;
+    }
+    return null;
+  }
+
+  // index.html の本文から ALL_DATA / DASHBOARD_DATA を取り出す。目印が無ければ null。
+  function extractData(html) {
+    var a = html.indexOf(DATA_BEGIN);
+    var b = html.indexOf(DATA_END);
+    if (a < 0 || b < 0 || b <= a) return null;
+    var body = html.slice(a + DATA_BEGIN.length, b);
+    try {
+      return (new Function(body + "\n;return {ALL_DATA: ALL_DATA, DASHBOARD_DATA: DASHBOARD_DATA};"))();
+    } catch (e) {
+      return null;
+    }
+  }
+
+  // beta で読んだカードを、旧UIの既読(summaryManagerState.readHistory)にも書く。pairs: [[ファイル名, 位置], ...]
+  // 旧UIの保存の他の項目は一切変えない。読めない・壊れている・形が違うときは null を返し、何も書かせない(旧UIの保存を壊さない)。
+  function addOldRead(stateText, pairs) {
+    var o;
+    if (stateText) {
+      try { o = JSON.parse(stateText); } catch (e) { return null; }
+      if (!isObj(o) || Object.prototype.toString.call(o) === "[object Array]") return null;
+    } else {
+      o = {};
+    }
+    if (o.readHistory === undefined || o.readHistory === null) o.readHistory = {};
+    else if (!isObj(o.readHistory) || Object.prototype.toString.call(o.readHistory) === "[object Array]") return null;
+    for (var i = 0; i < pairs.length; i++) o.readHistory[pairs[i][0] + "_" + pairs[i][1]] = true;
+    return JSON.stringify(o);
+  }
+
+  // 旧UIの既読から、指定のカードだけ外す(「昨日以前を既読」の取り消し用)。読めない・壊れているときは null。
+  function removeOldRead(stateText, pairs) {
+    var o;
+    try { o = JSON.parse(stateText); } catch (e) { return null; }
+    if (!isObj(o) || !isObj(o.readHistory)) return null;
+    for (var i = 0; i < pairs.length; i++) delete o.readHistory[pairs[i][0] + "_" + pairs[i][1]];
+    return JSON.stringify(o);
+  }
+
+  // まとめて既読にする。cards: [{key, filename, iIdx}]。戻り値 {read, keys(新しく既読にしたキー), pairs(旧UIへ書く [ファイル名, 位置])}
+  function bulkMark(readV2, cards, now) {
+    var out = {}, k, keys = [], pairs = [], i;
+    for (k in (readV2 || {})) if (Object.prototype.hasOwnProperty.call(readV2, k)) out[k] = readV2[k];
+    for (i = 0; i < cards.length; i++) {
+      pairs.push([cards[i].filename, cards[i].iIdx]);
+      if (!out[cards[i].key]) { out[cards[i].key] = now || 1; keys.push(cards[i].key); }
+    }
+    return { read: out, keys: keys, pairs: pairs };
+  }
+
+  // 取り消し。bulkMark が新しく既読にしたキーだけを外す(元から既読だったものは残す)。
+  function unmark(readV2, keys) {
+    var out = {}, k, drop = {}, i;
+    for (i = 0; i < keys.length; i++) drop[keys[i]] = true;
+    for (k in (readV2 || {})) if (Object.prototype.hasOwnProperty.call(readV2, k) && !drop[k]) out[k] = readV2[k];
+    return out;
+  }
+
+  // 生成時刻。index.html の本文の「生成: YYYY-MM-DD HH:MM」から。無ければ null。戻り値は ms(端末の時刻として解釈)。
+  function parseBuildTime(html) {
+    var m = /生成: (\d{4})-(\d\d)-(\d\d) (\d\d):(\d\d)/.exec(html || "");
+    if (!m) return null;
+    return new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]), Number(m[4]), Number(m[5])).getTime();
+  }
+
+  function agoLabel(ms) {
+    var min = Math.max(0, Math.floor(ms / 60000));
+    if (min < 1) return "いま";
+    if (min < 60) return min + "分前";
+    if (min < 60 * 24) return Math.floor(min / 60) + "時間前";
+    return Math.floor(min / 1440) + "日前";
+  }
+
+  // 次の定時更新(HH:MM の一覧のうち、いまより後で最も近いもの。無ければ翌日の最初)。
+  function nextChain(nowMs, times) {
+    var now = new Date(nowMs), best = null, i;
+    for (i = 0; i < times.length; i++) {
+      var p = times[i].split(":");
+      var t = new Date(now.getFullYear(), now.getMonth(), now.getDate(), Number(p[0]), Number(p[1])).getTime();
+      if (t <= nowMs) t += 86400000;
+      if (best === null || t < best) best = t;
+    }
+    return best;
+  }
+
+  function two(n) { return (n < 10 ? "0" : "") + n; }
+  function hhmm(ms) { var d = new Date(ms); return two(d.getHours()) + ":" + two(d.getMinutes()); }
+
+  // サマリーの人の言葉の見出し: 「RSS 10/29 朝」。ファイル名の _YYYYMMDD_HHMMSS から。
+  function fileHeading(file) {
+    var m = /_(\d{4})(\d\d)(\d\d)_(\d\d)/.exec((file && file.filename) || "");
+    var cat = (file && file.category) ? String(file.category) : "";
+    if (!m) return cat || (file && file.filename) || "";
+    var h = Number(m[4]);
+    var zone = h < 9 ? "朝" : (h < 16 ? "昼" : "夜");
+    return (cat ? cat + " " : "") + Number(m[2]) + "/" + Number(m[3]) + " " + zone;
+  }
+
+  // 「今日」の0時(端末の時刻)。「昨日以前」の境目。
+  function startOfDay(nowMs) { var d = new Date(nowMs); return new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime(); }
+
+  // サマリーの日付(ファイル名の _YYYYMMDD から)。無ければ null。
+  function fileDayStart(file) {
+    var m = /_(\d{4})(\d\d)(\d\d)_/.exec((file && file.filename) || "");
+    return m ? new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3])).getTime() : null;
+  }
+
+  // ---- ブラウザ側の起動(node のテストでは動かない) ----
+  function lsGet(key) { try { return localStorage.getItem(key); } catch (e) { return null; } }
+  function lsSet(key, val) { try { localStorage.setItem(key, val); return true; } catch (e) { return false; } }
+
+  function loadReadV2() {
+    var s = lsGet(READ_V2_KEY), o = null;
+    try { o = s ? JSON.parse(s) : null; } catch (e) { o = null; }
+    if (o && o.v === 2 && isObj(o.read)) return o.read;
+    // 保存があるのに読めない: 上書きする前に、別の名前へ退避する(失わない)。退避が済んでいれば重ねない。
+    if (s && !lsGet(READ_V2_KEY + "Broken")) lsSet(READ_V2_KEY + "Broken", s);
+    return {};
+  }
+  function saveReadV2(read) { return lsSet(READ_V2_KEY, JSON.stringify({ v: 2, read: read })); }
+
+  function loadOldHistory() {
+    var s = lsGet(OLD_STATE_KEY), o = null;
+    try { o = s ? JSON.parse(s) : null; } catch (e) { o = null; }
+    return (o && isObj(o.readHistory)) ? o.readHistory : {};
+  }
+
+  function boot(doc) {
+    var out = doc.getElementById("ym-status");
+    function say(t) { out.textContent = t; }
+    say("index.html を読み込み中…");
+    fetch("index.html", { cache: "no-cache" }).then(function (r) {
+      if (!r.ok) throw new Error("HTTP " + r.status);
+      return r.text();
+    }).then(function (html) {
+      var d = extractData(html);
+      if (!d) { say("index.html にデータの目印がありません。公開バッチを一度実行してください。"); return; }
+      var m = migrateOld(loadReadV2(), loadOldHistory(), d.ALL_DATA, Date.now());
+      var saved = saveReadV2(m.read);
+      var total = 0, unread = 0, cards = [];
+      for (var i = 0; i < d.ALL_DATA.length; i++) {
+        var f = d.ALL_DATA[i], items = f.items || [];
+        for (var j = 0; j < items.length; j++) {
+          if (items[j].is_error) continue;
+          total++;
+          cards.push({ filename: f.filename, iIdx: j, item: items[j], key: cardKey(items[j], f.filename, j), category: f.category });
+          if (!isRead(m.read, items[j], f.filename, j)) unread++;
+        }
+      }
+      var nRead = 0, k;
+      for (k in m.read) if (Object.prototype.hasOwnProperty.call(m.read, k)) nRead++;
+      var lines = ["サマリー " + d.ALL_DATA.length + "枚 / カード " + total + "件 / 未読 " + unread + "件",
+        "既読(V2) " + nRead + "件(今回の移行で +" + m.added + "、対応先なし " + m.unresolved + ")"];
+      if (typeof YMListen !== "undefined" && typeof ListenDepth !== "undefined") {
+        var pl = YMListen.plan(cards, {
+          order: "score", listenDepth: ListenDepth, rate: 2,
+          isRead: function (c) { return isRead(m.read, c.item, c.filename, c.iIdx); }
+        });
+        var cnt = {}, q;
+        for (q = 0; q < pl.session.length; q++) cnt[pl.session[q].name] = (cnt[pl.session[q].name] || 0) + 1;
+        var parts = [];
+        for (k in cnt) if (Object.prototype.hasOwnProperty.call(cnt, k)) parts.push(k + " " + cnt[k]);
+        lines.push("▶ 聴く " + pl.session.length + "件・" + YMListen.minutesLabel(pl.sec) + "(2倍速の見積もり。点数の高い順・15分で区切り)");
+        lines.push("深さ: " + parts.join(" / ") + "　残り " + pl.rest + "件");
+      }
+      if (!saved) lines.push("※既読を保存できませんでした(ブラウザの保存制限)");
+      say(lines.join("\n"));
+    }).catch(function (e) {
+      say("読み込みに失敗しました: " + e);
+    });
+  }
+
+  var api = {
+    READ_V2_KEY: READ_V2_KEY,
+    videoIdOf: videoIdOf,
+    cardKey: cardKey,
+    migrateOld: migrateOld,
+    isRead: isRead,
+    buildExport: buildExport,
+    importRead: importRead,
+    extractData: extractData,
+    addOldRead: addOldRead,
+    removeOldRead: removeOldRead,
+    bulkMark: bulkMark,
+    unmark: unmark,
+    parseBuildTime: parseBuildTime,
+    agoLabel: agoLabel,
+    nextChain: nextChain,
+    hhmm: hhmm,
+    fileHeading: fileHeading,
+    startOfDay: startOfDay,
+    fileDayStart: fileDayStart,
+    OLD_STATE_KEY: OLD_STATE_KEY,
+    loadReadV2: loadReadV2,
+    saveReadV2: saveReadV2,
+    loadOldHistory: loadOldHistory,
+    boot: boot
+  };
+  return api;
+});
+</script>
+<script>/*
+ * beta_app.js - 新UI(beta.html)の画面。ブラウザでだけ動く(node のテスト対象外。部品は beta_ui / beta_listen / beta_player 側でテスト済み)。
+ *
+ * ホーム → 「▶ 聴く」 → 聴く画面 → 15分で区切って「続けて聴く」。モックアップ v4(docs/mockups/mock_v4.html)の決定に沿う。
+ *   - 既読は beta の保存(summaryManagerReadV2)に書き、同時に旧UIの既読(summaryManagerState.readHistory)にも追加する。
+ *     読み終えたカードも「次」で飛ばしたカードも既読にする(利用者の決定)。戻る・止めるでは既読にしない。
+ *   - 👎👍・読み方の登録は旧UIと同じ部品(labels.js・tts_user_dict.js)で、同じ保存先・同じ合言葉(ytLabelKey)に送る。
+ *   - 背景再生は旧UIと同じ方式(聞こえない無音を繰り返し再生し、Media Session で操作を受ける)。
+ *
+ * 古いiOS Safariで構文エラーになる記法(アロー関数・let/const・?.・??・replaceAll・後読み)は使わない。
+ */
+(function (root, factory) {
+  root.YMApp = factory(root);
+})(typeof self !== "undefined" ? self : this, function (W) {
+  "use strict";
+
+  var RATES = [1.0, 1.2, 1.3, 1.4, 1.5, 1.6, 1.7, 1.8, 1.9, 2.0, 3.0];
+  var ORDERS = [
+    ["score", "点数の高い順", "サマリーをまたいで、★付きを先頭に、AIの点が高いものから。"],
+    ["newest", "サマリーごと・新しい順", "新しいサマリーから、サマリーの中は並んでいる順(今の「更新日時(新しい順)」と同じ)。"],
+    ["oldest", "サマリーごと・古い順", "古いサマリーから、サマリーの中は並んでいる順。"]
+  ];
+  // 定時の更新(ホームの「次は…」の表示用)。時刻を変えたらここも変える。
+  var CHAIN_TIMES = ["05:00", "11:30", "20:00"];
+  var IS_IOS = /iP(hone|ad|od)/.test((W.navigator && W.navigator.userAgent) || "");
+
+  var CSS = [
+    "body{margin:0;font-family:-apple-system,'Hiragino Sans',sans-serif;background:#f7fafc;color:#1a202c;-webkit-text-size-adjust:100%}",
+    ".ym{padding:16px;padding-bottom:calc(24px + env(safe-area-inset-bottom));max-width:640px;margin:0 auto}",
+    ".ym h1{font-size:1.1rem;margin:0 0 8px}",
+    ".ym pre{white-space:pre-wrap;font-size:.9rem;margin:0 0 12px;font-family:inherit}",
+    ".ym select{font-size:1rem;padding:8px;border-radius:8px;border:1px solid #cbd5e0;background:#fff}",
+    ".ym .row{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin:8px 0}",
+    ".ym .eyebrow{font-size:.8rem;color:#718096;margin-bottom:4px}",
+    ".ym .compass{background:#fff;border:1px solid #e2e8f0;border-radius:12px;padding:12px;margin:8px 0}",
+    ".ym .compass .t{font-size:1.05rem;font-weight:bold;line-height:1.5}",
+    ".ym .big{display:block;width:100%;min-height:72px;font-size:1.2rem;font-weight:bold;border:0;border-radius:14px;background:#3b6ab0;color:#fff;margin:12px 0}",
+    ".ym .big:disabled{background:#a0aec0}",
+    ".ym .chip{font-size:.95rem;padding:8px 12px;border-radius:999px;border:1px solid #cbd5e0;background:#fff;color:#2d3748}",
+    ".ym .chip.on{background:#3b6ab0;color:#fff;border-color:#3b6ab0}",
+    ".ym .btn{font-size:.95rem;padding:12px 14px;border-radius:10px;border:1px solid #cbd5e0;background:#fff;color:#2d3748;text-decoration:none;display:inline-block;min-height:20px}",
+    ".ym .files{background:#fff;border:1px solid #e2e8f0;border-radius:12px;margin:8px 0}",
+    ".ym .frow{display:flex;align-items:center;gap:10px;padding:12px;border-bottom:1px solid #edf2f7;font-size:.95rem}",
+    ".ym .frow:last-child{border-bottom:0}.ym .frow input{width:22px;height:22px}.ym .frow .h{flex:1}.ym .frow .n{color:#718096;font-size:.85rem}",
+    ".ym .meta{display:flex;justify-content:space-between;align-items:center;gap:8px;font-size:.9rem;color:#4a5568;margin:2px 0 6px}",
+    ".ym .bar{height:6px;background:#e2e8f0;border-radius:3px;margin:0 0 8px;overflow:hidden}.ym .bar i{display:block;height:100%;background:#3b6ab0}",
+    ".ym .card{background:#fff;border:2px solid #e2e8f0;border-radius:14px;padding:12px;margin:8px 0;display:flex;flex-direction:column;overflow:hidden;box-sizing:border-box;height:calc(max(20vh,110px) + 236px)}",
+    ".ym .card.star{background:#fffbeb;border-color:#d4a017}",
+    ".ym .thumb{display:block;width:100%;height:20vh;min-height:110px;object-fit:contain;border-radius:10px;background:#000;margin-bottom:8px}",
+    ".ym .badges{display:flex;gap:8px;align-items:center;margin:0 0 4px;flex-wrap:wrap}",
+    ".ym .score{font-size:.8rem;font-weight:bold;color:#fff;background:#3b6ab0;border-radius:6px;padding:2px 8px}",
+    ".ym .score.s1,.ym .score.s2{background:#a0aec0}.ym .score.s5{background:#d4a017}",
+    ".ym .chan{font-size:.85rem;color:#3b6ab0;font-weight:bold}",
+    ".ym .card h2{font-size:1.1rem;margin:2px 0 8px;line-height:1.4;min-height:2.8em;flex:none;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}",
+    ".ym .plab{font-size:.8rem;color:#718096;margin-bottom:4px}",
+    ".ym .ptext{font-size:1rem;line-height:1.6;background:#fef9c3;border-radius:8px;box-sizing:border-box;padding:8px 8px 0;height:calc(4.8rem + 8px);flex:none;overflow-y:auto;-webkit-overflow-scrolling:touch}",
+    ".ym .lbl-sc{display:flex;gap:6px;margin:12px 0}",
+    ".ym .lbl-sc button{flex:1;min-height:64px;border-radius:12px;border:2px solid #2c5282;background:#fff;color:#1a365d;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:2px;font-size:.75rem}.ym .lbl-sc button b{font-size:1.3rem}",
+    ".ym .lbl-t{font-weight:bold;font-size:1.05rem;line-height:1.5;margin:6px 0}.ym .lbl-m{font-size:.85rem;color:#4a5568;margin-bottom:6px}",
+    ".ym .dline{display:flex;gap:6px;margin:8px 0 2px}",
+    ".ym .dline button{flex:1 1 0;min-width:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:2px;font-size:.85rem;white-space:nowrap;padding:6px 0;border-radius:10px;border:1px solid #cbd5e0;background:#fff;color:#2d3748;min-height:48px}",
+    ".ym .dline button small{font-size:.7rem;color:#718096}",
+    ".ym .dline button.on{background:#3b6ab0;color:#fff;border-color:#3b6ab0}.ym .dline button.on small{color:#e2e8f0}",
+    ".ym .dline button.pin{flex:0 0 40px}",
+    ".ym .why{font-size:.85rem;color:#4a5568;margin:4px 0 8px;min-height:1.3em}",
+    ".ym .wide{display:flex;gap:8px;margin:8px 0}",
+    ".ym .wide button{flex:1;height:72px;font-size:1.1rem;font-weight:bold;border-radius:14px;border:2px solid #2c5282;background:#fff;color:#1a365d}",
+    ".ym .wide button.sel{background:#bee3f8}",
+    ".ym .wide button.main{background:#3b6ab0;color:#fff}",
+    ".ym .links{display:flex;gap:8px;margin:8px 0}",
+    ".ym .links a,.ym .links button{flex:1;text-align:center;font-size:.95rem;padding:12px 4px;border-radius:10px;border:1px solid #cbd5e0;background:#fff;color:#2d3748;text-decoration:none}",
+    ".ym .dock{position:fixed;left:0;right:0;bottom:0;background:#f7fafc;border-top:1px solid #e2e8f0;padding:0 16px calc(8px + env(safe-area-inset-bottom));z-index:30}",
+    ".ym .dock-in{max-width:640px;margin:0 auto}",
+    ".ym.listening{padding-bottom:300px}",
+    ".toast{position:fixed;left:12px;right:12px;bottom:calc(12px + env(safe-area-inset-bottom));background:#2d3748;color:#fff;border-radius:10px;padding:10px 12px;font-size:.9rem;display:none;z-index:50;align-items:center;gap:12px}",
+    ".toast.up{bottom:calc(290px + env(safe-area-inset-bottom))}",
+    ".toast.show{display:flex}.toast.warn{background:#c53030}.toast span{flex:1}",
+    ".toast button{font-size:.95rem;font-weight:bold;color:#2d3748;background:#fff;border:0;border-radius:8px;padding:8px 12px}",
+    ".ym .sheet{position:fixed;left:0;right:0;bottom:0;top:12%;background:#fff;border-radius:16px 16px 0 0;box-shadow:0 -4px 20px rgba(0,0,0,.25);padding:14px 14px calc(14px + env(safe-area-inset-bottom));overflow:auto;z-index:40;display:none;-webkit-overflow-scrolling:touch}",
+    ".ym .sheet.show{display:block}",
+    ".ym .sheet h3{margin:12px 0 4px;font-size:.95rem;color:#3b6ab0}",
+    ".ym .sheet .sec{white-space:pre-wrap;line-height:1.7;font-size:1rem;border-radius:8px;padding:6px 8px;margin:2px 0}",
+    ".ym .sheet .sec.hl{background:#fef9c3}",
+    ".ym .sheet .ph{color:#2b6cb0;font-weight:700;margin-top:10px}.ym .sheet .ph:first-child{margin-top:0}.ym .sheet .pli{margin:2px 0 4px;color:#4a5568}",
+    ".ym .sheet .close{position:sticky;top:0;display:block;margin:0 0 8px auto;z-index:2;font-size:1rem;padding:8px 14px;border-radius:10px;border:1px solid #cbd5e0;background:#fff}",
+    ".ym .sheet .foot{display:flex;gap:8px;margin:16px 0 4px}.ym .sheet .foot>*{flex:1;text-align:center;padding:14px 4px;border-radius:10px;border:1px solid #cbd5e0;background:#fff;color:#2d3748;text-decoration:none;font-size:1rem}",
+    ".ym .opt{display:block;width:100%;text-align:left;padding:12px;margin:8px 0;border-radius:10px;border:2px solid #e2e8f0;background:#fff;font-size:1rem}",
+    ".ym .opt.on{border-color:#3b6ab0;background:#ebf4ff}.ym .opt small{display:block;color:#718096;margin-top:4px;font-size:.85rem}",
+    ".ym .dinp{display:block;width:100%;box-sizing:border-box;font-size:1rem;padding:10px;margin:8px 0;border:1px solid #cbd5e0;border-radius:8px}",
+    ".ym .dnote{font-size:.85rem;color:#718096;margin:4px 0}.ym .dlab{font-size:.8rem;color:#3b6ab0;margin-top:6px}",
+    ".ym .dtext{font-size:1rem;line-height:1.6;background:#f1f5f9;border-radius:8px;padding:8px;-webkit-user-select:text;user-select:text}",
+    ".ym .dmsg{font-size:.9rem;color:#2f855a;min-height:1.4em;margin:6px 0}.ym .dmsg.warn{color:#c53030}",
+    ".ym .ditem{display:flex;align-items:center;gap:8px;padding:6px 0;border-bottom:1px solid #edf2f7}",
+    ".ym .dw{font-weight:bold}.ym .dr{flex:1;color:#4a5568}.ym .dtag{font-size:.75rem;color:#718096}",
+    ".ym .dx{font-size:1.1rem;padding:6px 12px;border-radius:8px;border:1px solid #cbd5e0;background:#fff}"
+  ].join("");
+
+  function el(doc, tag, cls, text) {
+    var e = doc.createElement(tag);
+    if (cls) e.className = cls;
+    if (text !== undefined && text !== null) e.textContent = text;
+    return e;
+  }
+  function lsGet(k) { try { return W.localStorage.getItem(k); } catch (e) { return null; } }
+  function lsSet(k, v) { try { W.localStorage.setItem(k, v); return true; } catch (e) { return false; } }
+  function isStarred(item) { return !!item && (item.is_favorite === true || item.category === "Followed Note"); }
+
+  // チャンネル名。末尾の「(登録者数…)」は表示とも要らないので外す(👎👍の記録と同じ整え方)。
+  function channelName(item) {
+    var c = item && typeof item.channel === "string" ? item.channel : "";
+    return c.replace(/\s*[\(（]登録者数[^)）]*[\)）]\s*$/, "").replace(/^\s+|\s+$/g, "");
+  }
+
+  // カードの出どころのサマリー名(例: 「RSS 10/29 朝」)
+  function fileHeadingOf(ctx, filename) {
+    var i, d = ctx.data.ALL_DATA;
+    for (i = 0; i < d.length; i++) if (d[i].filename === filename) return W.YMBeta.fileHeading(d[i]);
+    return "";
+  }
+
+  // 主なポイント: 旧UIと同じく、小見出し(青の太字)と箇条書きに分けて出す。見出しが見つからなければ、ただの文にする。
+  function pointsBlocks(ctx, html, host) {
+    var doc = ctx.doc, n = 0;
+    try {
+      var dom = new W.DOMParser().parseFromString(String(html || ""), "text/html"), kids = dom.body.children, i;
+      for (i = 0; i < kids.length; i++) {
+        var k = kids[i], tag = k.tagName.toLowerCase();
+        var isHead = (tag === "p" && /fw-bold/.test(k.className)) || /^h[1-6]$/.test(tag) || /2b6cb0/i.test(k.getAttribute("style") || "");
+        if (isHead && tag !== "ul") { host.appendChild(el(doc, "div", "ph", k.textContent.replace(/^\s+|\s+$/g, ""))); n++; }
+        else if (tag === "ul" || tag === "ol") {
+          var lis = k.querySelectorAll("li"), j;
+          for (j = 0; j < lis.length; j++) host.appendChild(el(doc, "div", "pli", "・" + lis[j].textContent.replace(/^\s+|\s+$/g, "")));
+        } else if (k.textContent.replace(/\s/g, "")) host.appendChild(el(doc, "div", "pli", plainBlocks(k.innerHTML)));
+      }
+    } catch (e) { n = 0; }
+    if (!n) { host.innerHTML = ""; host.textContent = plainBlocks(html); }
+  }
+
+  function plainBlocks(html) {
+    return String(html || "").replace(/<\/(li|p|div|h[1-6]|ul|ol)>/gi, "\n").replace(/<br\s*\/?>/gi, "\n")
+      .replace(/<[^>]*>/g, "").replace(/&nbsp;/g, " ").replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">")
+      .replace(/&quot;/g, "\"").replace(/&#39;/g, "'").replace(/\n{3,}/g, "\n\n").replace(/^\s+|\s+$/g, "");
+  }
+
+  // ---- 背景再生(旧UIの bgKeep と同じ方式) ----
+  var bgKeep = { el: null, stopTimer: null, wake: null };
+  function wavUrl() {
+    var rate = 8000, n = rate, buf = new ArrayBuffer(44 + n * 2), v = new DataView(buf);
+    function w(off, s) { for (var i = 0; i < s.length; i++) v.setUint8(off + i, s.charCodeAt(i)); }
+    w(0, "RIFF"); v.setUint32(4, 36 + n * 2, true); w(8, "WAVE"); w(12, "fmt "); v.setUint32(16, 16, true);
+    v.setUint16(20, 1, true); v.setUint16(22, 1, true); v.setUint32(24, rate, true); v.setUint32(28, rate * 2, true);
+    v.setUint16(32, 2, true); v.setUint16(34, 16, true); w(36, "data"); v.setUint32(40, n * 2, true);
+    return W.URL.createObjectURL(new W.Blob([buf], { type: "audio/wav" }));
+  }
+  function bgStart() {
+    try {
+      if (bgKeep.stopTimer) { clearTimeout(bgKeep.stopTimer); bgKeep.stopTimer = null; }
+      if (!bgKeep.el) { bgKeep.el = new W.Audio(wavUrl()); bgKeep.el.loop = true; bgKeep.el.setAttribute("playsinline", ""); }
+      if (bgKeep.el.paused) { var p = bgKeep.el.play(); if (p && p.catch) p.catch(function () { }); }
+    } catch (e) { }
+    try {
+      if (W.navigator.wakeLock && !bgKeep.wake && !bgKeep.asking) {
+        bgKeep.asking = true;
+        W.navigator.wakeLock.request("screen").then(function (s) {
+          bgKeep.asking = false; bgKeep.wake = s;
+          // タブが隠れると、ブラウザが自動で解放する。解放されたら持っている印を外し、戻ったときに取り直せるようにする。
+          try { s.addEventListener("release", function () { if (bgKeep.wake === s) bgKeep.wake = null; }); } catch (e2) { }
+        }, function () { bgKeep.asking = false; bgKeep.wake = null; });
+      }
+    } catch (e) { bgKeep.asking = false; }
+  }
+  function bgStopSoon(isPlaying) {
+    if (bgKeep.stopTimer) clearTimeout(bgKeep.stopTimer);
+    bgKeep.stopTimer = setTimeout(function () {
+      bgKeep.stopTimer = null;
+      try { if (bgKeep.el && !isPlaying()) { bgKeep.el.pause(); bgKeep.el.currentTime = 0; } } catch (e) { }
+      try { if (bgKeep.wake) { bgKeep.wake.release(); bgKeep.wake = null; } } catch (e) { }
+    }, 8000);
+  }
+  function setMediaSession(ctx) {
+    if (!("mediaSession" in W.navigator)) return;
+    function act(name) { return function () { if (ctx.player) ctx.player[name](); }; }
+    try {
+      W.navigator.mediaSession.setActionHandler("play", act("play"));
+      W.navigator.mediaSession.setActionHandler("pause", act("pause"));
+      W.navigator.mediaSession.setActionHandler("stop", act("pause"));
+      W.navigator.mediaSession.setActionHandler("nexttrack", act("next"));
+      W.navigator.mediaSession.setActionHandler("previoustrack", act("prev"));
+    } catch (e) { }
+  }
+  // 聴く画面を離れたら、ロック画面・イヤホンの操作を外す(離れた後に勝手に読み始めない)。
+  function clearMediaSession() {
+    if (!("mediaSession" in W.navigator)) return;
+    var names = ["play", "pause", "stop", "nexttrack", "previoustrack"], i;
+    for (i = 0; i < names.length; i++) { try { W.navigator.mediaSession.setActionHandler(names[i], null); } catch (e) { } }
+    try { W.navigator.mediaSession.metadata = null; } catch (e) { }
+  }
+  function safeUrl(u) { return /^https?:\/\//i.test(String(u || "")) ? String(u) : ""; }
+  // ロック画面の表示: 題名・チャンネル・何件目か・深さ。
+  function setMediaMeta(title, artist, album) {
+    if (!("mediaSession" in W.navigator) || !W.MediaMetadata) return;
+    try { W.navigator.mediaSession.metadata = new W.MediaMetadata({ title: title, artist: artist, album: album }); } catch (e) { }
+  }
+
+  function pickVoice(ut) {
+    ut.lang = "ja-JP";
+    var vs = [];
+    try { vs = W.speechSynthesis.getVoices() || []; } catch (e) { }
+    var ja = [], i;
+    for (i = 0; i < vs.length; i++) if (vs[i].lang && vs[i].lang.indexOf("ja") >= 0) ja.push(vs[i]);
+    if (!ja.length) return;
+    function find(f) { for (var k = 0; k < ja.length; k++) if (f(ja[k])) return ja[k]; return null; }
+    var best = find(function (v) { return /siri/i.test(v.name) && v.name.indexOf("2") >= 0; }) ||
+      find(function (v) { return /siri/i.test(v.name); }) ||
+      find(function (v) { return v.name.indexOf("Premium") >= 0 || v.name.indexOf("Enhanced") >= 0; }) ||
+      find(function (v) { return v.name.indexOf("Natural") >= 0; }) ||
+      find(function (v) { return v.name.indexOf("Haruka") >= 0; }) ||
+      find(function (v) { return v.name.indexOf("Microsoft") >= 0; });
+    ut.voice = best || ja[ja.length - 1];
+  }
+
+  // ---- 状態 ----
+  function readJson(key) { var s = lsGet(key), o = null; try { o = s ? JSON.parse(s) : null; } catch (e) { o = null; } return o; }
+
+  function buildCtx(doc, data, html) {
+    var cards = [], byKey = {}, i, j, ymb = W.YMBeta;
+    for (i = 0; i < data.ALL_DATA.length; i++) {
+      var f = data.ALL_DATA[i], items = f.items || [];
+      for (j = 0; j < items.length; j++) {
+        if (items[j].is_error) continue;
+        var c = { filename: f.filename, iIdx: j, item: items[j], key: ymb.cardKey(items[j], f.filename, j), category: f.category };
+        cards.push(c);
+        (byKey[c.key] = byKey[c.key] || []).push(c);
+      }
+    }
+    var r = parseFloat(lsGet("ymBetaRate"));
+    var o = lsGet("ymBetaOrder");
+    var own = readJson("ymBetaFiles");
+    var oldState = readJson(ymb.OLD_STATE_KEY);
+    var ctx = {
+      doc: doc, data: data, cards: cards, byKey: byKey, read: {}, migrated: null, saved: true, builtAt: ymb.parseBuildTime(html),
+      rate: (r > 0) ? r : (IS_IOS ? 1.5 : 2.0), order: (o === "newest" || o === "oldest") ? o : "score",
+      ownFiles: (own && typeof own === "object") ? own : {},
+      oldChecked: (oldState && oldState.checkedFiles && typeof oldState.checkedFiles === "object") ? oldState.checkedFiles : {},
+      player: null, sessionRead: 0, sessionUp: 0, sessionDown: 0, thumbLast: {}, thumbClient: null,
+      dictStore: null, dictClient: null, hist: [], lastSource: "", pinKey: lsGet("ymBetaPin") || null, metaKey: ""
+    };
+    ctx.migrated = ymb.migrateOld(ymb.loadReadV2(), ymb.loadOldHistory(), data.ALL_DATA, Date.now());
+    ctx.read = ctx.migrated.read;
+    ctx.saved = ymb.saveReadV2(ctx.read);
+    try {
+      if (W.YtLabels && W.YM_LABELS_CONFIG && W.YtLabels.createFeedbackClient) {
+        ctx.thumbClient = W.YtLabels.createFeedbackClient({
+          url: W.YM_LABELS_CONFIG.url, anonKey: W.YM_LABELS_CONFIG.anonKey, storage: W.localStorage,
+          getKey: function () { return lsGet("ytLabelKey") || ""; }
+        });
+        ctx.thumbClient.flush().then(null, function () { });
+      }
+    } catch (e) { ctx.thumbClient = null; }
+    try { if (W.TtsUserDict) ctx.dictStore = W.TtsUserDict.createStore({ storage: W.localStorage, device: IS_IOS ? "iPhone" : "PC" }); } catch (e) { ctx.dictStore = null; }
+    try {
+      if (W.YtLabels && W.YM_LABELS_CONFIG && W.YtLabels.createTtsDictClient) {
+        ctx.dictClient = W.YtLabels.createTtsDictClient({
+          url: W.YM_LABELS_CONFIG.url, anonKey: W.YM_LABELS_CONFIG.anonKey, storage: null,
+          getKey: function () { return lsGet("ytLabelKey") || ""; }
+        });
+      }
+    } catch (e) { ctx.dictClient = null; }
+    return ctx;
+  }
+
+  function isReadCard(ctx, c) { return W.YMBeta.isRead(ctx.read, c.item, c.filename, c.iIdx); }
+
+  // 聴くサマリーのチェック: beta で決めたものが先。無ければ旧UIのチェック(外してあるものは外れたまま)。
+  function isChecked(ctx, filename) {
+    if (Object.prototype.hasOwnProperty.call(ctx.ownFiles, filename)) return ctx.ownFiles[filename] !== false;
+    return ctx.oldChecked[filename] !== false;
+  }
+  function checkedMap(ctx) {
+    var m = {}, i;
+    for (i = 0; i < ctx.data.ALL_DATA.length; i++) {
+      var fn = ctx.data.ALL_DATA[i].filename;
+      if (!isChecked(ctx, fn)) m[fn] = false;
+    }
+    return m;
+  }
+
+  function persistRead(ctx) { if (!W.YMBeta.saveReadV2(ctx.read)) ctx.saved = false; }
+
+  function writeOld(pairs) {
+    var ymb = W.YMBeta;
+    var t = ymb.addOldRead(lsGet(ymb.OLD_STATE_KEY), pairs);
+    if (t !== null) lsSet(ymb.OLD_STATE_KEY, t);
+  }
+
+  function markRead(ctx, card) {
+    if (!ctx.read[card.key]) { ctx.read[card.key] = Date.now(); ctx.sessionRead++; }
+    persistRead(ctx);
+    var pairs = [], same = ctx.byKey[card.key] || [card], i;
+    for (i = 0; i < same.length; i++) pairs.push([same[i].filename, same[i].iIdx]);
+    writeOld(pairs);
+  }
+
+  function makePlan(ctx) {
+    return W.YMListen.plan(ctx.cards, {
+      order: ctx.order, listenDepth: W.ListenDepth, rate: ctx.rate, checkedFiles: checkedMap(ctx),
+      isRead: function (c) { return isReadCard(ctx, c); }
+    });
+  }
+
+  function unreadCount(ctx, onlyToday) {
+    var n = 0, i, t0 = W.YMBeta.startOfDay(Date.now()), dayOf = {};
+    for (i = 0; i < ctx.data.ALL_DATA.length; i++) dayOf[ctx.data.ALL_DATA[i].filename] = W.YMBeta.fileDayStart(ctx.data.ALL_DATA[i]);
+    for (i = 0; i < ctx.cards.length; i++) {
+      if (isReadCard(ctx, ctx.cards[i])) continue;
+      if (onlyToday && dayOf[ctx.cards[i].filename] !== t0) continue;
+      n++;
+    }
+    return n;
+  }
+
+  // ---- 部品: 下から出るシート・知らせ ----
+  function toast(ctx, msg, warn, action) {
+    var t = ctx.toastEl, doc = ctx.doc;
+    if (!t) return;
+    t.innerHTML = "";
+    t.appendChild(el(doc, "span", "", msg));
+    if (action) {
+      var b = el(doc, "button", "", action.label);
+      b.addEventListener("click", function () { t.className = "toast"; action.run(); });
+      t.appendChild(b);
+    }
+    var up = ctx.root && ctx.root.className.indexOf("listening") >= 0 ? " up" : "";
+    t.className = "toast show" + (warn ? " warn" : "") + up;
+    if (ctx.toastTimer) clearTimeout(ctx.toastTimer);
+    ctx.toastTimer = setTimeout(function () { t.className = "toast"; }, action ? (action.ms || 8000) : 2800);
+  }
+
+  function ensureOverlays(ctx) {
+    var doc = ctx.doc;
+    ctx.sheet = el(doc, "div", "sheet"); ctx.root.appendChild(ctx.sheet);
+    // 通知は1つだけ作って body に置く。画面を描き直しても(取り消しボタンごと)消えない。
+    if (!ctx.toastEl) { ctx.toastEl = el(doc, "div", "toast"); doc.body.appendChild(ctx.toastEl); }
+  }
+
+  function openSheet(ctx, mode, title) {
+    var doc = ctx.doc, sh = ctx.sheet;
+    sh.innerHTML = "";
+    sh.setAttribute("data-mode", mode);
+    var close = el(doc, "button", "close", "閉じる");
+    close.addEventListener("click", function () { closeSheet(ctx); });
+    sh.appendChild(close);
+    if (title) sh.appendChild(el(doc, "h2", "", title));
+    sh.className = "sheet show";
+    sh.scrollTop = 0;
+    return sh;
+  }
+  function closeSheet(ctx) { ctx.sheet.className = "sheet"; ctx.sheet.setAttribute("data-mode", ""); }
+
+  function selectEl(doc, opts, cur, onChange) {
+    var s = el(doc, "select"), i;
+    for (i = 0; i < opts.length; i++) {
+      var o = el(doc, "option", "", opts[i][1]); o.value = String(opts[i][0]);
+      if (String(opts[i][0]) === String(cur)) o.selected = true;
+      s.appendChild(o);
+    }
+    s.addEventListener("change", function () { onChange(s.value); });
+    return s;
+  }
+  function rateOptions() { var rr = [], i; for (i = 0; i < RATES.length; i++) rr.push([RATES[i], RATES[i] + "倍速"]); return rr; }
+
+  // ---- ホーム ----
+  function fileStats(ctx) {
+    var map = {}, i;
+    for (i = 0; i < ctx.data.ALL_DATA.length; i++) map[ctx.data.ALL_DATA[i].filename] = { file: ctx.data.ALL_DATA[i], total: 0, unread: 0 };
+    for (i = 0; i < ctx.cards.length; i++) {
+      var s = map[ctx.cards[i].filename];
+      if (!s) continue;
+      s.total++;
+      if (!isReadCard(ctx, ctx.cards[i])) s.unread++;
+    }
+    var out = [], k;
+    for (k in map) if (Object.prototype.hasOwnProperty.call(map, k) && map[k].total > 0) out.push(map[k]);
+    out.sort(function (a, b) { return a.file.filename < b.file.filename ? 1 : (a.file.filename > b.file.filename ? -1 : 0); });
+    return out;
+  }
+
+  function fileRow(ctx, s, rerender) {
+    var doc = ctx.doc, row = el(doc, "label", "frow"), cb = el(doc, "input");
+    cb.type = "checkbox"; cb.checked = isChecked(ctx, s.file.filename);
+    cb.addEventListener("change", function () {
+      ctx.ownFiles[s.file.filename] = cb.checked;
+      lsSet("ymBetaFiles", JSON.stringify(ctx.ownFiles));
+      rerender();
+    });
+    row.appendChild(cb);
+    row.appendChild(el(doc, "span", "h", W.YMBeta.fileHeading(s.file)));
+    row.appendChild(el(doc, "span", "n", "未読 " + s.unread + " / " + s.total + "件"));
+    return row;
+  }
+
+  function openOrder(ctx) {
+    var doc = ctx.doc, sh = openSheet(ctx, "order", "読む順"), i;
+    function mk(o) {
+      var b = el(doc, "button", "opt" + (ctx.order === o[0] ? " on" : ""), o[1]);
+      b.appendChild(el(doc, "small", "", o[2]));
+      b.addEventListener("click", function () { ctx.order = o[0]; lsSet("ymBetaOrder", o[0]); closeSheet(ctx); renderHome(ctx); });
+      return b;
+    }
+    for (i = 0; i < ORDERS.length; i++) sh.appendChild(mk(ORDERS[i]));
+    sh.appendChild(el(doc, "div", "dnote", "「▶ 聴く」に効きます。聴くサマリーのチェックを外したサマリーは読みません。"));
+  }
+
+  function openAllFiles(ctx) {
+    var doc = ctx.doc, sh = openSheet(ctx, "files", "聴くサマリー"), stats = fileStats(ctx), box = el(doc, "div", "files"), i;
+    function again() { openAllFiles(ctx); renderHomeBehind(ctx); }
+    for (i = 0; i < stats.length; i++) box.appendChild(fileRow(ctx, stats[i], again));
+    sh.appendChild(el(doc, "div", "dnote", "チェックを外したサマリーは、「▶ 聴く」で読みません。"));
+    sh.appendChild(box);
+  }
+
+  // シートを開いたまま、後ろのホームの数字だけ更新する。
+  function renderHomeBehind(ctx) { if (ctx.refreshHome) ctx.refreshHome(); }
+
+  function markOlderRead(ctx) {
+    var ymb = W.YMBeta, t0 = ymb.startOfDay(Date.now()), list = [], i;
+    for (i = 0; i < ctx.cards.length; i++) {
+      var f = null, k;
+      for (k = 0; k < ctx.data.ALL_DATA.length; k++) if (ctx.data.ALL_DATA[k].filename === ctx.cards[i].filename) { f = ctx.data.ALL_DATA[k]; break; }
+      var day = ymb.fileDayStart(f);
+      if (day !== null && day < t0 && !isReadCard(ctx, ctx.cards[i])) list.push(ctx.cards[i]);
+    }
+    if (!list.length) { toast(ctx, "昨日以前の未読はありません", false); return; }
+    if (!W.confirm("昨日以前のサマリーの未読 " + list.length + "件を、すべて既読にします。よろしいですか(8秒間は取り消せます)")) return;
+    var res = ymb.bulkMark(ctx.read, list, Date.now());
+    ctx.read = res.read; persistRead(ctx); writeOld(res.pairs);
+    renderHome(ctx);
+    toast(ctx, "昨日以前の " + list.length + "件を既読にしました", false, {
+      label: "取り消す", ms: 8000,
+      run: function () {
+        ctx.read = ymb.unmark(ctx.read, res.keys); persistRead(ctx);
+        var t = ymb.removeOldRead(lsGet(ymb.OLD_STATE_KEY), res.pairs);
+        if (t !== null) lsSet(ymb.OLD_STATE_KEY, t);
+        renderHome(ctx);
+        toast(ctx, "取り消しました", false);
+      }
+    });
+  }
+
+  function renderHome(ctx) {
+    var doc = ctx.doc, root = ctx.root, m = ctx.migrated, ymb = W.YMBeta, now = Date.now(), i;
+    root.innerHTML = "";
+    root.className = "ym";
+    ctx.refreshHome = function () { var keep = ctx.sheet; var toastKeep = ctx.toastEl; renderHomeKeep(ctx, keep, toastKeep); };
+    var plan = makePlan(ctx);
+
+    var eb = "";
+    if (ctx.builtAt) eb = ymb.hhmm(ctx.builtAt) + "に更新(" + ymb.agoLabel(now - ctx.builtAt) + ")・次は" + ymb.hhmm(ymb.nextChain(now, CHAIN_TIMES));
+    if (eb) root.appendChild(el(doc, "div", "eyebrow", eb));
+    root.appendChild(el(doc, "h1", "", "YouTubeサマリー V2"));
+
+    var comp = ctx.data.DASHBOARD_DATA && ctx.data.DASHBOARD_DATA.compass;
+    if (comp && comp.needle_text) {
+      var cb = el(doc, "div", "compass");
+      cb.appendChild(el(doc, "div", "eyebrow", "🧭 本日の方角"));
+      cb.appendChild(el(doc, "div", "t", W.YMListen.stripHtml(comp.needle_text)));
+      if (comp.sub_text) cb.appendChild(el(doc, "div", "dnote", W.YMListen.stripHtml(comp.sub_text)));
+      var cBtn = el(doc, "button", "btn", ctx.compassOn ? "⏹ 止める" : "🔊 聴く"); cBtn.id = "ymCompassBtn";
+      cBtn.addEventListener("click", function () { toggleCompass(ctx, compassText(ctx), cBtn); });
+      cb.appendChild(cBtn);
+      root.appendChild(cb);
+    }
+
+    var b = el(doc, "button", "big", plan.session.length ? ("▶ 聴く " + plan.session.length + "件・" + W.YMListen.minutesLabel(plan.sec)) : "聴く未読がありません");
+    b.disabled = !plan.session.length;
+    b.addEventListener("click", function () { startListening(ctx, plan); });
+    root.appendChild(b);
+
+    var cnt = {}, q, parts = [], k;
+    for (q = 0; q < plan.session.length; q++) cnt[plan.session[q].name] = (cnt[plan.session[q].name] || 0) + 1;
+    for (k in cnt) if (Object.prototype.hasOwnProperty.call(cnt, k)) parts.push(k + " " + cnt[k]);
+    var info = "未読 " + unreadCount(ctx, false) + "件(今日の新着 " + unreadCount(ctx, true) + "件)・今回に入らない未読 " + plan.rest + "件\n" +
+      "深さ(自動): " + (parts.join(" / ") || "-") + "\n" + ctx.rate + "倍速の見積もり。15分で区切ります。";
+    if (!ctx.saved) info += "\n※既読を保存できませんでした(ブラウザの保存制限)";
+    root.appendChild(el(doc, "pre", "", info));
+
+    var row = el(doc, "div", "row");
+    var ob = el(doc, "button", "btn", "読む順: " + ORDERS[ctx.order === "score" ? 0 : (ctx.order === "newest" ? 1 : 2)][1] + " ▾");
+    ob.addEventListener("click", function () { openOrder(ctx); });
+    row.appendChild(ob);
+    row.appendChild(selectEl(doc, rateOptions(), ctx.rate, function (v) { ctx.rate = parseFloat(v); lsSet("ymBetaRate", v); renderHome(ctx); }));
+    root.appendChild(row);
+
+    // 今日届いたサマリー(人の言葉の見出し・未読/カード数・聴くかどうかのチェック)
+    var stats = fileStats(ctx), t0 = ymb.startOfDay(now), todays = [];
+    var hidden = 0;
+    for (i = 0; i < stats.length; i++) if (ymb.fileDayStart(stats[i].file) === t0) {
+      if (stats[i].unread > 0 || ctx.showAllToday) todays.push(stats[i]); else hidden++;
+    }
+    root.appendChild(el(doc, "div", "eyebrow", "今日届いたサマリー(チェックしたものを聴きます)"));
+    var box = el(doc, "div", "files");
+    if (!todays.length) box.appendChild(el(doc, "div", "frow", hidden ? "今日の未読はありません。" : "今日のサマリーはまだありません。"));
+    for (i = 0; i < todays.length; i++) box.appendChild(fileRow(ctx, todays[i], function () { renderHome(ctx); }));
+    root.appendChild(box);
+    if (hidden || ctx.showAllToday) {
+      var tg = el(doc, "button", "btn", ctx.showAllToday ? "未読なしを隠す" : "未読なしの " + hidden + "件も表示");
+      tg.addEventListener("click", function () { ctx.showAllToday = !ctx.showAllToday; renderHome(ctx); });
+      root.appendChild(tg);
+    }
+
+    var row2 = el(doc, "div", "row");
+    var all = el(doc, "button", "btn", "すべてのサマリー…");
+    all.addEventListener("click", function () { openAllFiles(ctx); });
+    var older = el(doc, "button", "btn", "昨日以前をすべて既読");
+    older.addEventListener("click", function () { markOlderRead(ctx); });
+    var list = el(doc, "a", "btn", "一覧で見る"); list.href = "index.html";
+    row2.appendChild(all); row2.appendChild(older); row2.appendChild(list);
+    root.appendChild(row2);
+    if (labelClient(ctx)) {
+      var lb = el(doc, "button", "btn", labelButtonText(ctx));
+      lb.id = "ymLabelBtn";
+      lb.addEventListener("click", function () { openLabeling(ctx); });
+      row2.appendChild(lb);
+      if (!ctx.lblLoaded) {
+        ctx.lblLoaded = true;
+        var lc = labelClient(ctx);
+        lc.flush().then(function () { return lc.countToday(W.YtLabels.jstDay()); })
+          .then(function (n) { ctx.lblToday = n; var b = doc.getElementById("ymLabelBtn"); if (b) b.textContent = labelButtonText(ctx); }, function () { });
+      }
+    }
+    root.appendChild(el(doc, "div", "dnote", "旧UIからの既読の移行: +" + m.added + "件(対応先なし " + m.unresolved + "件)"));
+    ensureOverlays(ctx);
+  }
+
+  // シートを開いたままホームの数字を更新する(聴くサマリーのチェックを切り替えたとき)。
+  function renderHomeKeep(ctx, keepSheet, keepToast) {
+    var open = keepSheet && keepSheet.className.indexOf("show") >= 0, html = keepSheet ? keepSheet.innerHTML : "", mode = keepSheet ? keepSheet.getAttribute("data-mode") : "";
+    renderHome(ctx);
+    if (open && mode === "files") openAllFiles(ctx);
+    else if (open) { ctx.sheet.innerHTML = html; ctx.sheet.className = keepSheet.className; }
+  }
+
+  // ---- 聴く画面 ----
+  function ttsPrep(ctx, text) {
+    if (!text) return text;
+    ctx.lastSource = text;
+    if (ctx.hist[0] !== text) { ctx.hist.unshift(text); if (ctx.hist.length > 3) ctx.hist.length = 3; }
+    var out = text;
+    if (W.TTSClean) {
+      try {
+        var extra = (ctx.dictStore && ctx.dictStore.count() > 0) ? ctx.dictStore.dict() : null;
+        var c = W.TTSClean.clean(text, extra ? { extraDict: extra } : undefined);
+        if (c && c.replace(/\s/g, "")) out = c;
+      } catch (e) { out = text; }
+    }
+    return out.replace(/[：:×・]/g, "、").replace(/#+/g, "");
+  }
+
+  function thumbPress(ctx, dir) {
+    var st = ctx.player && ctx.player.state();
+    var e = st && st.entry;
+    if (!e) { toast(ctx, "再生中のカードがありません", true); return; }
+    if (!ctx.thumbClient) { toast(ctx, "保存先が設定されていないため、記録できません", true); return; }
+    var row = W.YtLabels.buildFeedbackRow(e.card.item, dir, { device: IS_IOS ? "iPhone" : "PC", category: e.card.category });
+    if (!row) { toast(ctx, "このカードにはAIの点が無いため、記録できません", true); return; }
+    var word = dir === "up" ? "いいね" : "よくないね";
+    if (ctx.thumbLast[row.card_key] === dir) { toast(ctx, "すでに" + word + "を記録済みです", false); return; }
+    ctx.thumbClient.submit(row).then(function (r) {
+      if (r === "denied") {
+        var v = W.prompt("ラベル用の合言葉を入力してください(初回だけ)", "");
+        var t = String(v || "").trim();
+        if (t) { lsSet("ytLabelKey", t); toast(ctx, "合言葉を保存しました。もう一度押してください", false); }
+        else toast(ctx, "合言葉が合わないため、保存できません", true);
+        return;
+      }
+      if (r === "rejected") { toast(ctx, "保存できませんでした(形式エラー)", true); return; }
+      if (ctx.thumbLast[row.card_key] === undefined) { if (dir === "up") ctx.sessionUp++; else ctx.sessionDown++; }
+      ctx.thumbLast[row.card_key] = dir;
+      if (ctx.player) updateListen(ctx, ctx.player.state());
+      toast(ctx, word + "を記録: " + row.shown_score + " → " + row.rating + " として扱います" + (r === "queued" ? "(未送信。電波が戻ったら再送します)" : ""), false);
+    });
+  }
+
+  // 全文シート: いま読んでいる部分を黄色で示す。開いている間も読み上げは続き、カードが進めば中身も替わる。
+  function fullKey(st) { return st.entry ? st.entry.card.key + "|" + st.entry.card.filename + "_" + st.entry.card.iIdx : ""; }
+
+  function buildFull(ctx, st) {
+    var e = st.entry, it, doc = ctx.doc, sh = ctx.sheet, secs, i;
+    if (!e) return;
+    it = e.card.item;
+    sh.innerHTML = "";
+    sh.setAttribute("data-mode", "full");
+    ctx.fullKey = fullKey(st);
+    var close = el(doc, "button", "close", "閉じる");
+    close.addEventListener("click", function () { closeSheet(ctx); });
+    sh.appendChild(close);
+    var t = el(doc, "h2", "sec", W.YMListen.stripHtml(it.title)); t.setAttribute("data-part", "title");
+    sh.appendChild(t);
+    if (channelName(it)) sh.appendChild(el(doc, "div", "chan", channelName(it)));
+    secs = [["要旨", it.summary, "summary"], ["結論", it.conclusion, "conclusion"], ["主なポイント", it.points, "points"]];
+    for (i = 0; i < secs.length; i++) {
+      if (!secs[i][1]) continue;
+      sh.appendChild(el(doc, "h3", "", secs[i][0]));
+      var d = el(doc, "div", "sec", secs[i][2] === "points" ? "" : plainBlocks(secs[i][1])); d.setAttribute("data-part", secs[i][2]);
+      if (secs[i][2] === "points") pointsBlocks(ctx, secs[i][1], d);
+      sh.appendChild(d);
+    }
+    var foot = el(doc, "div", "foot");
+    var keep = el(doc, "button", "", "閉じて聴き続ける");
+    keep.addEventListener("click", function () { closeSheet(ctx); if (ctx.player && !ctx.player.state().playing) ctx.player.play(); });
+    foot.appendChild(keep);
+    if (safeUrl(it.url)) {
+      var a = el(doc, "a", "", "🔗 元の記事を開く"); a.href = safeUrl(it.url); a.target = "_blank"; a.rel = "noopener";
+      a.addEventListener("click", function () { ctx.player.pause(); });
+      foot.appendChild(a);
+    }
+    sh.appendChild(foot);
+  }
+
+  function updateFullHighlight(ctx, st) {
+    var sh = ctx.sheet;
+    if (!sh || sh.getAttribute("data-mode") !== "full" || sh.className.indexOf("show") < 0) return;
+    if (ctx.fullKey !== fullKey(st)) { var top = sh.scrollTop; buildFull(ctx, st); sh.className = "sheet show"; sh.scrollTop = 0; }
+    var secs = sh.querySelectorAll(".sec"), i, cur = st.part ? st.part.part : "";
+    for (i = 0; i < secs.length; i++) secs[i].className = "sec" + (secs[i].getAttribute("data-part") === cur ? " hl" : "");
+  }
+
+  function openFull(ctx) {
+    var st = ctx.player.state();
+    if (!st.entry) return;
+    buildFull(ctx, st);
+    ctx.sheet.className = "sheet show";
+    ctx.sheet.scrollTop = 0;
+    updateFullHighlight(ctx, st);
+  }
+
+  // 深さの説明(長押し・ⓘ): 3つの意味と、今回の分を各深さで聴いた場合の合計時間。
+  function openDepthHelp(ctx) {
+    var doc = ctx.doc, sh = openSheet(ctx, "depth", "深さについて"), st = ctx.player.state(), i, k;
+    var items = ctx.sessionPlan ? ctx.sessionPlan.session : [];
+    sh.appendChild(el(doc, "h3", "", "3つの使い方"));
+    sh.appendChild(el(doc, "div", "sec", "🎧 自動 … 点数などから、カードごとに深さを決めます。\nこのカードだけ … 深さのボタンを押す。次のカードからは自動(または📌)に戻ります。\n📌 ずっと … 📌を押すと、今の深さをずっと使います。もう一度押すと外れます。"));
+    sh.appendChild(el(doc, "h3", "", "今回の" + items.length + "件を、この深さで聴くと(" + st.rate + "倍速)"));
+    var d = W.YMListen.DEPTHS;
+    for (i = 0; i < d.length; i++) {
+      var sum = 0;
+      for (k = 0; k < items.length; k++) sum += W.YMListen.estimateSec(items[k].card.item, d[i].depth, st.rate);
+      sh.appendChild(el(doc, "div", "sec", d[i].name + " … " + W.YMListen.minutesLabel(sum)));
+    }
+  }
+
+  function setPinFromCurrent(ctx) {
+    var st = ctx.player.state();
+    if (ctx.pinKey) { ctx.pinKey = null; lsSet("ymBetaPin", ""); }
+    else {
+      var d = st.depthKey || (st.entry ? st.entry.key : null);
+      ctx.pinKey = d; lsSet("ymBetaPin", d || "");
+    }
+    ctx.player.setPin(ctx.pinKey);
+  }
+
+  function renderListen(ctx) {
+    var doc = ctx.doc, root = ctx.root, ui = {}, i;
+    root.innerHTML = "";
+    root.className = "ym listening";
+    ctx.ui = ui;
+
+    ui.head = el(doc, "div", "meta");
+    ui.pos = el(doc, "span");
+    ui.rate = selectEl(doc, rateOptions(), ctx.rate, function (v) { ctx.rate = parseFloat(v); lsSet("ymBetaRate", v); ctx.player.setRate(ctx.rate); });
+    ui.head.appendChild(ui.pos); ui.head.appendChild(ui.rate);
+    root.appendChild(ui.head);
+    var bar = el(doc, "div", "bar"); ui.fill = el(doc, "i"); bar.appendChild(ui.fill); root.appendChild(bar);
+
+    ui.card = el(doc, "div", "card");
+    ui.thumb = el(doc, "img", "thumb"); ui.thumb.alt = "";
+    ui.thumb.addEventListener("click", function () { openFull(ctx); });
+    ui.badges = el(doc, "div", "badges");
+    ui.score = el(doc, "span", "score"); ui.chan = el(doc, "span", "chan");
+    ui.badges.appendChild(ui.score); ui.badges.appendChild(ui.chan);
+    ui.title = el(doc, "h2"); ui.title.addEventListener("click", function () { openFull(ctx); });
+    ui.plab = el(doc, "div", "plab"); ui.ptext = el(doc, "div", "ptext");
+    ui.card.appendChild(ui.thumb); ui.card.appendChild(ui.badges); ui.card.appendChild(ui.title); ui.card.appendChild(ui.plab); ui.card.appendChild(ui.ptext);
+    root.appendChild(ui.card);
+
+    // 深さの列: 🎧自動 / 題名 / 要旨 / ＋結論 / 全部(それぞれ約N分) / 📌 / ⓘ
+    ui.dline = el(doc, "div", "dline");
+    ui.chips = {};
+    function mkChip(key, name) {
+      var b = el(doc, "button", "", name);
+      b.appendChild(el(doc, "small", "", ""));
+      b.addEventListener("click", function () { ctx.player.setDepth(key || null); });
+      ui.chips[key] = b; ui.dline.appendChild(b);
+    }
+    mkChip("", "自動");
+    for (i = 0; i < W.YMListen.DEPTHS.length; i++) mkChip(W.YMListen.DEPTHS[i].key, W.YMListen.DEPTHS[i].name);
+    ui.pin = el(doc, "button", "pin", "📌"); ui.pin.addEventListener("click", function () { setPinFromCurrent(ctx); });
+    ui.info = el(doc, "button", "pin", "ⓘ"); ui.info.addEventListener("click", function () { openDepthHelp(ctx); });
+    ui.dline.appendChild(ui.pin); ui.dline.appendChild(ui.info);
+    // 長押しでも説明を開く(0.5秒)
+    var pressT = null, swallow = false;
+    ui.dline.addEventListener("click", function (ev) { if (swallow) { swallow = false; ev.preventDefault(); ev.stopPropagation(); } }, true);
+    ui.dline.addEventListener("touchstart", function () { swallow = false; pressT = setTimeout(function () { pressT = null; swallow = true; openDepthHelp(ctx); }, 500); }, { passive: true });
+    ui.dline.addEventListener("touchend", function () { if (pressT) { clearTimeout(pressT); pressT = null; } });
+    ui.dline.addEventListener("touchmove", function () { if (pressT) { clearTimeout(pressT); pressT = null; } }, { passive: true });
+    root.appendChild(ui.dline);
+    ui.why = el(doc, "div", "why"); root.appendChild(ui.why);
+
+    var home = el(doc, "div", "links");
+    var hb = el(doc, "button", "", "ホームへ戻る");
+    hb.addEventListener("click", function () { leaveListen(ctx); });
+    home.appendChild(hb);
+    root.appendChild(home);
+
+    // 操作のボタンは画面の下に固定する。カードの文の長さが変わっても、ボタンは動かない。
+    var dock = el(doc, "div", "dock"), dockIn = el(doc, "div", "dock-in");
+    dock.appendChild(dockIn);
+    var th = el(doc, "div", "wide");
+    ui.down = el(doc, "button", "", "👎 よくない"); ui.up = el(doc, "button", "", "👍 いいね");
+    ui.down.addEventListener("click", function () { thumbPress(ctx, "down"); });
+    ui.up.addEventListener("click", function () { thumbPress(ctx, "up"); });
+    th.appendChild(ui.down); th.appendChild(ui.up);
+    dockIn.appendChild(th);
+
+    var nav = el(doc, "div", "wide");
+    var prev = el(doc, "button", "", "⏮ 前"); ui.play = el(doc, "button", "main", "⏸ 停止"); var next = el(doc, "button", "", "次 ⏭");
+    prev.addEventListener("click", function () { ctx.player.prev(); });
+    next.addEventListener("click", function () { ctx.player.next(); });
+    ui.play.addEventListener("click", function () { if (ctx.player.state().playing) ctx.player.pause(); else ctx.player.play(); });
+    nav.appendChild(prev); nav.appendChild(ui.play); nav.appendChild(next);
+    dockIn.appendChild(nav);
+
+    var links = el(doc, "div", "links");
+    var full = el(doc, "button", "", "📄 全文");
+    full.addEventListener("click", function () { openFull(ctx); });
+    ui.src = el(doc, "a", "", "🔗 元の記事"); ui.src.target = "_blank"; ui.src.rel = "noopener";
+    ui.src.addEventListener("click", function () { ctx.player.pause(); });      // 元の記事を開くときは読み上げを止める
+    var rd = el(doc, "button", "", "🗣 読み方");
+    rd.addEventListener("click", function () { openDict(ctx); });
+    links.appendChild(full); links.appendChild(ui.src); links.appendChild(rd);
+    dockIn.appendChild(links);
+    root.appendChild(dock);
+
+    ensureOverlays(ctx);
+  }
+
+  // 画像が無いカードは、カード全体の高さを変えずに、画像の高さぶんを文の欄にまわす。行の途中で切れないよう、欄の高さは行の整数倍にそろえる。
+  function fitText(ui) {
+    var t = ui.ptext, hasThumb = ui.thumb.style.display !== "none";
+    if (hasThumb) { t.style.flex = ""; t.style.height = ""; return; }
+    t.style.flex = "1 1 auto"; t.style.height = "";
+    var h = t.clientHeight, lh = parseFloat(W.getComputedStyle(t).lineHeight) || 25.6, n = Math.floor((h - 8) / lh);
+    if (n >= 3) { t.style.flex = "none"; t.style.height = (n * lh + 8) + "px"; }
+  }
+
+  function updateListen(ctx, st) {
+    var ui = ctx.ui, e = st.entry, it, key, per, i;
+    if (!ui || !e) return;
+    it = e.card.item;
+    ui.pos.textContent = (st.i + 1) + " / " + st.total + "件・残り" + W.YMListen.minutesLabel(st.remainingSec);
+    ui.fill.style.width = Math.round(100 * st.i / Math.max(1, st.total)) + "%";
+    ui.card.className = "card" + (isStarred(it) ? " star" : "");
+    if (it.thumbnail) { if (ui.thumb.getAttribute("src") !== it.thumbnail) ui.thumb.src = it.thumbnail; ui.thumb.style.display = ""; }
+    else ui.thumb.style.display = "none";
+    var sc = it.ai && typeof it.ai.s === "number" ? it.ai.s : null;
+    ui.score.textContent = sc === null ? "" : String(sc);
+    ui.score.className = "score" + (sc === null ? "" : " s" + sc);
+    ui.score.style.display = sc === null ? "none" : "";
+    ui.chan.textContent = channelName(it) + (it.duration ? (channelName(it) ? "・" : "") + it.duration : "");
+    ui.title.textContent = W.YMListen.stripHtml(it.title);
+    var pn = { title: "題名", summary: "要旨", conclusion: "結論", points: "主なポイント" };
+    var fh = fileHeadingOf(ctx, e.card.filename);
+    ui.plab.textContent = (fh ? fh + "・" : "") + (st.part ? ("いま読んでいる部分: " + pn[st.part.part]) : "");
+    var shown = st.part ? st.part.text.replace(/^\d+番。\s*/, "") : "";
+    if (ui.ptext.textContent !== shown) { ui.ptext.textContent = shown; ui.ptext.scrollTop = 0; }
+    fitText(ui);
+    ui.play.textContent = st.playing ? "⏸ 停止" : "▶ 再生";
+
+    // 深さの列: 各深さの約N分(このカード)、いま効いている深さを青く。
+    per = W.YMListen.perDepth(it, st.rate);
+    var eff = st.depthKey || st.pinKey || e.key;
+    for (key in ui.chips) if (Object.prototype.hasOwnProperty.call(ui.chips, key)) {
+      var b = ui.chips[key], small = b.lastChild, on;
+      if (key === "") { on = !st.depthKey && !st.pinKey; small.textContent = e.name; }
+      else {
+        on = (key === eff) && (key === st.depthKey || (!st.depthKey && !!st.pinKey && key === st.pinKey) || false);
+        for (i = 0; i < per.length; i++) if (per[i].key === key) small.textContent = per[i].label;
+      }
+      b.className = on ? "on" : "";
+    }
+    ui.pin.className = "pin" + (st.pinKey ? " on" : "");
+    ui.why.textContent = st.depthKey ? ("このカードだけ「" + st.depthName + "」") :
+      (st.pinKey ? ("📌 ずっと「" + st.depthName + "」") : ("🎧自動: " + e.why + " → " + e.name));
+
+    if (safeUrl(it.url)) { ui.src.href = safeUrl(it.url); ui.src.style.display = ""; } else ui.src.style.display = "none";
+    var k = W.YtLabels ? W.YtLabels.cardKey(it) : "";
+    ui.up.className = (k && ctx.thumbLast[k] === "up") ? "sel" : "";
+    ui.down.className = (k && ctx.thumbLast[k] === "down") ? "sel" : "";
+
+    // ロック画面: 題名・チャンネル・何件目か・深さ
+    var mk = st.i + "|" + st.depthName;
+    if (ctx.metaKey !== mk) {
+      ctx.metaKey = mk;
+      setMediaMeta(W.YMListen.stripHtml(it.title), channelName(it) || "YouTubeサマリー", (st.i + 1) + "/" + st.total + "件・" + st.depthName);
+    }
+    updateFullHighlight(ctx, st);
+  }
+
+  // ---- 学習(盲検で1〜5を付ける。答えは Supabase の yt_labels へ。旧UIと同じ表・同じ上限) ----
+  function labelClient(ctx) {
+    if (ctx.lblClient === undefined) {
+      ctx.lblClient = null;
+      try {
+        if (W.YtLabels && W.YM_LABELS_CONFIG && W.YtLabels.createClient) {
+          ctx.lblClient = W.YtLabels.createClient({
+            url: W.YM_LABELS_CONFIG.url, anonKey: W.YM_LABELS_CONFIG.anonKey, storage: W.localStorage,
+            getKey: function () { return lsGet("ytLabelKey") || ""; }
+          });
+        }
+      } catch (e) { ctx.lblClient = null; }
+    }
+    return ctx.lblClient;
+  }
+
+  function labelButtonText(ctx) {
+    var c = labelClient(ctx);
+    if (!c || ctx.lblToday === undefined) return "🏷 学習";
+    return "🏷 学習(今日あと" + W.YtLabels.dailyState(ctx.lblToday + c.pending()).remaining + "件)";
+  }
+
+  function labelPool(ctx, L) {
+    var since = Date.now() / 1000 - 28 * 86400, pool = [], repeatPool = [], old = Date.now() - W.YtLabels.REPEAT_MIN_DAYS * 86400 * 1000;
+    var queued = ctx.lblClient.pendingKeys(), i, j;
+    for (i = 0; i < ctx.data.ALL_DATA.length; i++) {
+      var fd = ctx.data.ALL_DATA[i];
+      if ((fd.mtime || 0) < since) continue;
+      var items = fd.items || [];
+      for (j = 0; j < items.length; j++) {
+        var it = items[j];
+        if (!it || it.is_error || it.type !== "youtube" || !it.ai || typeof it.ai.s !== "number") continue;
+        var key = W.YtLabels.cardKey(it);
+        if (!key || L.answered[key] || queued[key]) continue;
+        var c = { key: key, category: fd.category || "", s: it.ai.s, ref: it };
+        if (!L.labeled[key]) pool.push(c); else if (L.labeled[key] < old) repeatPool.push(c);
+      }
+    }
+    return { pool: pool, repeatPool: repeatPool };
+  }
+
+  function openLabeling(ctx) {
+    var doc = ctx.doc, client = labelClient(ctx), L = { batch: [], idx: 0, today: 0, labeled: {}, answered: {}, busy: false };
+    if (!client) return;
+    if (ctx.player) ctx.player.pause();
+    var sh = openSheet(ctx, "label", "学習");
+    var msg = el(doc, "div", "dmsg", "読み込み中…"), box = el(doc, "div", "lblbox");
+    sh.appendChild(msg); sh.appendChild(box);
+    function say(t, warn) { msg.textContent = t || ""; msg.className = "dmsg" + (warn ? " warn" : ""); }
+    function done(text, retry) {
+      box.innerHTML = "";
+      box.appendChild(el(doc, "div", "dtext", text));
+      var b = el(doc, "button", "opt", retry ? "もう一度" : "閉じる");
+      b.addEventListener("click", function () { if (retry) openLabeling(ctx); else closeSheet(ctx); });
+      box.appendChild(b);
+    }
+    function refreshBtn() { ctx.lblToday = L.today; var b = doc.getElementById("ymLabelBtn"); if (b) b.textContent = labelButtonText(ctx); }
+    function show() {
+      var st;
+      if (L.idx >= L.batch.length) {
+        st = W.YtLabels.dailyState(L.today + client.pending());
+        say("");
+        done("おつかれさまでした。" + (st.remaining > 0 ? "今日はあと" + st.remaining + "件(" + st.roundsLeft + "回分)できます。" : "今日の分(60件)はおわりです。また明日。"), false);
+        refreshBtn();
+        return;
+      }
+      var card = L.batch[L.idx], it = card.ref;
+      box.innerHTML = "";
+      box.appendChild(el(doc, "div", "dnote", (L.idx + 1) + " / " + L.batch.length));
+      box.appendChild(el(doc, "div", "lbl-t", W.YMListen.stripHtml(it.title || "(題名なし)")));
+      box.appendChild(el(doc, "div", "lbl-m", channelName(it) + (it.duration ? "・" + it.duration : "") + (card.category ? "・" + card.category : "")));
+      if (it.summary) { box.appendChild(el(doc, "h3", "", "要旨")); box.appendChild(el(doc, "div", "sec", plainBlocks(it.summary))); }
+      if (it.conclusion) { box.appendChild(el(doc, "h3", "", "結論")); box.appendChild(el(doc, "div", "sec", plainBlocks(it.conclusion))); }
+      var sc = el(doc, "div", "lbl-sc"), labs = ["読まない", "あまり", "ふつう", "読みたい", "必ず読む"], n;
+      function mk(v) {
+        var b = el(doc, "button", "", ""); b.appendChild(el(doc, "b", "", String(v))); b.appendChild(el(doc, "span", "", labs[v - 1]));
+        b.addEventListener("click", function () { answer(card, v); });
+        return b;
+      }
+      for (n = 1; n <= 5; n++) sc.appendChild(mk(n));
+      box.appendChild(sc);
+      var skip = el(doc, "button", "opt", "スキップ(判断できない)");
+      skip.addEventListener("click", function () { if (L.busy) return; L.idx++; show(); sh.scrollTop = 0; });
+      box.appendChild(skip);
+      box.appendChild(el(doc, "div", "dnote", "AIの点は表示していません。「このカードを開いて読む価値があるか」を、いつもの感覚で付けてください。"));
+      sh.scrollTop = 0;
+    }
+    function answer(card, score) {
+      if (L.busy) return;
+      L.busy = true;
+      var row = W.YtLabels.buildRow(card, score, { device: IS_IOS ? "iPhone" : "PC" });
+      client.submit(row).then(function (r) {
+        L.busy = false;
+        if (r === "denied") {
+          var v = W.prompt("ラベル用の合言葉を入力してください(初回だけ)", ""), t = String(v || "").trim();
+          if (t) lsSet("ytLabelKey", t);
+          say(t ? "合言葉を保存しました。もう一度、答えてください。" : "合言葉が合わないため、保存できません。", true);
+          return;
+        }
+        if (r === "sent") L.today += 1;
+        L.answered[card.key] = 1; L.idx++;
+        var pend = client.pending();
+        say(r === "rejected" ? "保存できなかった回答がありました(形式エラー)。" : (pend > 0 ? "未送信 " + pend + "件(電波が戻ったら自動で再送します)" : ""), r === "rejected" || pend > 0);
+        refreshBtn();
+        show();
+      });
+    }
+    if (!lsGet("ytLabelKey")) {
+      var v0 = W.prompt("ラベル用の合言葉を入力してください(初回だけ)", ""), t0 = String(v0 || "").trim();
+      if (!t0) { say(""); done("合言葉が必要です。", true); return; }
+      lsSet("ytLabelKey", t0);
+    }
+    client.flush().then(function () {
+      return Promise.all([client.countToday(W.YtLabels.jstDay()), client.listLabeled()]);
+    }).then(function (res) {
+      L.today = res[0];
+      res[1].forEach(function (r) {
+        var t = Date.parse(r.labeled_at) || 1;
+        if (!L.labeled[r.card_key] || t > L.labeled[r.card_key]) L.labeled[r.card_key] = t;
+      });
+      refreshBtn();
+      var st = W.YtLabels.dailyState(L.today + client.pending());
+      if (st.size === 0) { say(""); done("今日の分(60件)はおわりです。また明日。", false); return; }
+      var p = labelPool(ctx, L);
+      L.batch = W.YtLabels.pickBatch(p.pool, { n: st.size, repeatPool: p.repeatPool });
+      if (!L.batch.length) { say(""); done("いま答えられるカードがありません。新しいサマリーが増えたら、また。", false); return; }
+      say("今日あと" + st.remaining + "件。この回は" + L.batch.length + "件です。");
+      show();
+    }, function () { say(""); done("つながりませんでした。電波のよい所で、もう一度。", true); });
+  }
+
+  // ---- 読み方の登録(旧UIと同じ辞書: 端末に保存し、共有の辞書にも送る) ----
+  function openDict(ctx) {
+    var store = ctx.dictStore, doc = ctx.doc, i;
+    if (!store || !W.TtsUserDict) { toast(ctx, "読み方の部品を読み込めませんでした", true); return; }
+    if (ctx.player) ctx.player.pause();      // 登録中は読み上げを止める(続きは再生ボタンで)
+    var sh = openSheet(ctx, "dict", "読み方を登録");
+
+    sh.appendChild(el(doc, "h3", "", "直前に読み上げた文"));
+    var histBox = el(doc, "div", "dhist");
+    var names = ["いま", "1つ前", "2つ前"];
+    if (!ctx.hist.length) histBox.appendChild(el(doc, "div", "dnote", "まだ読み上げていません。言葉は手で入力できます。"));
+    for (i = 0; i < ctx.hist.length; i++) {
+      histBox.appendChild(el(doc, "div", "dlab", names[i]));
+      histBox.appendChild(el(doc, "div", "dtext", ctx.hist[i]));
+    }
+    sh.appendChild(histBox);
+    sh.appendChild(el(doc, "div", "dnote", "上の文の中の言葉を長押しで選ぶと、「言葉」の欄に入ります。"));
+
+    var word = el(doc, "input", "dinp"); word.type = "text"; word.placeholder = "言葉(例: Claude)"; word.setAttribute("autocomplete", "off");
+    var reading = el(doc, "input", "dinp"); reading.type = "text"; reading.placeholder = "正しい読み(例: クロード)"; reading.setAttribute("autocomplete", "off");
+    sh.appendChild(word); sh.appendChild(reading);
+    var msg = el(doc, "div", "dmsg");
+    function say(t, warn) { msg.textContent = t || ""; msg.className = "dmsg" + (warn ? " warn" : ""); }
+
+    var row = el(doc, "div", "links");
+    var test = el(doc, "button", "", "▶ 試し読み"), add = el(doc, "button", "", "＋ 登録");
+    row.appendChild(test); row.appendChild(add);
+    sh.appendChild(row); sh.appendChild(msg);
+
+    var listHead = el(doc, "h3", ""), list = el(doc, "div", "dlist");
+    sh.appendChild(listHead); sh.appendChild(list);
+
+    function renderList() {
+      var items = store.entries(), k;
+      list.innerHTML = "";
+      listHead.textContent = "登録した言葉(" + items.length + ")";
+      if (!items.length) list.appendChild(el(doc, "div", "dnote", "まだ登録がありません。"));
+      function mkRow(e) {
+        var r = el(doc, "div", "ditem");
+        r.appendChild(el(doc, "span", "dw", e.w)); r.appendChild(el(doc, "span", "dr", e.r));
+        r.appendChild(el(doc, "span", "dtag", e.status === "local" ? "端末のみ" : "共有"));
+        var x = el(doc, "button", "dx", "×"); x.setAttribute("aria-label", e.w + "を削除");
+        x.addEventListener("click", function () {
+          if (!W.confirm("「" + e.w + "」の登録を削除しますか")) return;
+          store.remove(e.w); say("削除しました。"); renderList(); sync();
+        });
+        r.appendChild(x);
+        return r;
+      }
+      for (k = 0; k < items.length; k++) list.appendChild(mkRow(items[k]));
+    }
+
+    function sync() {
+      return store.sync(ctx.dictClient).then(function (r) {
+        renderList();
+        if (r && ctx.dictClient) {
+          if (r.denied) say("合言葉が合わないか、1日の上限に達したため、共有に送れませんでした(端末には保存されています)", true);
+          else if (r.rejected > 0) say(r.rejected + "件は共有に受け付けられませんでした(端末には保存されています)", true);
+          else if (r.failed > 0) say("通信できないため、共有には送れていません。次に開いたときに再送します(端末には保存されています)", true);
+          else if (r.sent > 0) say("共有の辞書にも送信しました(他の端末にも反映されます)");
+        }
+      }, function () { });
+    }
+
+    add.addEventListener("click", function () {
+      var res = store.add(word.value, reading.value);
+      if (!res.ok) { say(res.error, true); return; }
+      word.value = ""; reading.value = "";
+      say("登録しました。次の読み上げから効きます。");
+      renderList();
+      if (ctx.dictClient && !lsGet("ytLabelKey") && !ctx.dictAsked) {      // 共有に送るための合言葉(👎👍と同じもの)
+        ctx.dictAsked = true;
+        var v = String(W.prompt("共有の辞書に送るための合言葉を入力してください(初回だけ)", "") || "").trim();
+        if (v) lsSet("ytLabelKey", v);
+      }
+      sync();
+    });
+
+    // 試し読み: 直前に読んだ文のうち、その言葉を含む1文を、その読みで聞く(無ければ言葉そのもの)
+    test.addEventListener("click", function () {
+      var w = word.value.replace(/^\s+|\s+$/g, ""), r = reading.value.replace(/^\s+|\s+$/g, "");
+      var err = W.TtsUserDict.validate(w, r);
+      if (err) { say(err, true); return; }
+      var base = ctx.hist.length ? ctx.hist[0] : w, h, seg, ps, p;
+      for (h = 0; h < ctx.hist.length; h++) if (ctx.hist[h].indexOf(w) >= 0) { base = ctx.hist[h]; break; }
+      seg = base; ps = base.split("。");
+      for (p = 0; p < ps.length; p++) if (ps[p].indexOf(w) >= 0) { seg = ps[p]; break; }
+      if (seg.length > 120) { var at = Math.max(0, seg.indexOf(w) - 40); seg = seg.slice(at, at + 120); }
+      var extra = {}, cur = store.dict(), k;
+      for (k in cur) if (Object.prototype.hasOwnProperty.call(cur, k)) extra[k] = cur[k];
+      extra[w] = r;
+      var txt = seg;
+      if (W.TTSClean) { try { txt = W.TTSClean.clean(seg, { extraDict: extra }) || seg; } catch (e) { txt = seg; } }
+      try {
+        W.speechSynthesis.cancel();
+        var ut = new W.SpeechSynthesisUtterance(txt);
+        ut.rate = ctx.rate; pickVoice(ut);
+        W.speechSynthesis.speak(ut);
+        say("試し読み: " + (txt.length > 40 ? txt.slice(0, 40) + "…" : txt));
+      } catch (e) { say("試し読みできませんでした。", true); }
+    });
+
+    if (!ctx.dictSelBound) {
+      ctx.dictSelBound = true;
+      doc.addEventListener("selectionchange", function () {
+        var s2 = ctx.sheet;
+        if (!s2 || s2.getAttribute("data-mode") !== "dict" || s2.className.indexOf("show") < 0) return;
+        var sel = W.getSelection ? W.getSelection() : null;
+        if (!sel || sel.isCollapsed || !sel.anchorNode) return;
+        var wi = s2.querySelector("input.dinp"), hb = s2.querySelector(".dhist");
+        if (!wi || !hb || !hb.contains(sel.anchorNode)) return;
+        var t = sel.toString().replace(/^\s+|\s+$/g, "");
+        if (t && t.length <= 40) wi.value = t;
+      });
+    }
+
+    renderList();
+    sync();
+  }
+
+  // ---- 終わり・離れる・始める ----
+  function renderEnd(ctx) {
+    var doc = ctx.doc, root = ctx.root;
+    root.innerHTML = "";
+    root.className = "ym";
+    root.appendChild(el(doc, "h1", "", "ここまで聴きました"));
+    var plan = makePlan(ctx);
+    root.appendChild(el(doc, "pre", "", "この回で既読にしたカード: " + ctx.sessionRead + "件\n👍 " + ctx.sessionUp + "件 / 👎 " + ctx.sessionDown + "件\n残りの未読: " + plan.total + "件"));
+    if (plan.session.length) {
+      var more = el(doc, "button", "big", "▶ 続けて聴く(次の" + plan.session.length + "件・" + W.YMListen.minutesLabel(plan.sec) + ")");
+      more.addEventListener("click", function () { startListening(ctx, plan); });
+      root.appendChild(more);
+    }
+    var hb = el(doc, "button", "chip", "ホームへ戻る");
+    hb.addEventListener("click", function () { renderHome(ctx); });
+    root.appendChild(hb);
+    ensureOverlays(ctx);
+  }
+
+  // 聴き終わりを声でも知らせる(画面を見ていなくても分かるように)。
+  function announceEnd(ctx) {
+    setTimeout(function () {      // 「次」で終わったときは、直前に cancel しているので、少し間を空ける(iOSは直後の speak が落ちる)
+      try {
+        var ut = new W.SpeechSynthesisUtterance("聴き終わりました。");
+        ut.rate = ctx.rate; pickVoice(ut);
+        W.speechSynthesis.speak(ut);
+      } catch (e) { }
+    }, 80);
+  }
+
+  function leaveListen(ctx) {
+    if (ctx.player) { ctx.player.destroy(); ctx.player = null; }
+    clearMediaSession();
+    bgStopSoon(function () { return false; });
+    renderHome(ctx);
+  }
+
+  // 本日の方角の読み上げ文: 針の1行 + 「今日読むもの」のうち「仕事に効く」「プライベート」の中身(見出し・要旨・事実・理由・行動)。
+  function compassText(ctx) {
+    var d = ctx.data.DASHBOARD_DATA, comp = d && d.compass, out = [];
+    function plain(t) { return W.YMListen.stripHtml(String(t || "")).replace(/^\s+|\s+$/g, ""); }
+    function end(t) { t = plain(t); return t && !/[。!?！？]$/.test(t) ? t + "。" : t; }
+    if (comp && comp.needle_text) out.push(end(comp.needle_text));
+    try {
+      if (d && d.es_html && W.DOMParser) {
+        var dom = new W.DOMParser().parseFromString(d.es_html, "text/html"), box = dom.querySelector(".es"), kids = box ? box.children : [], i, on = false;
+        for (i = 0; i < kids.length; i++) {
+          var k = kids[i], cls = " " + k.className + " ";
+          if (cls.indexOf(" es-group ") >= 0) {
+            var g = plain(k.textContent);
+            on = (g === "仕事に効く" || g === "プライベート");
+            if (on) out.push(end(g));
+          } else if (cls.indexOf(" es-item ") >= 0 && on) {
+            var h = k.querySelector(".es-head b"), sm = k.querySelector(".es-sum"), fs = k.querySelectorAll(".es-facts li"), why = k.querySelector(".es-why"), act = k.querySelector(".es-act"), j;
+            if (h) out.push(end(h.textContent));
+            if (sm) out.push(end(sm.textContent));
+            for (j = 0; j < fs.length; j++) out.push(end(fs[j].textContent));
+            if (why) out.push(end(why.textContent));
+            if (act) out.push(end(act.textContent));
+          } else on = false;
+        }
+      }
+    } catch (e) { }
+    return out.join("\n");
+  }
+
+  // 本日の方角を読み上げる(ボタンで始め・止め)。聴く画面に入る前に必ず止める。
+  function stopCompass(ctx) {
+    ctx.cgen = (ctx.cgen || 0) + 1;
+    if (ctx.compassOn) { ctx.compassOn = false; try { W.speechSynthesis.cancel(); } catch (e) { } }
+  }
+  function toggleCompass(ctx, text, btn) {
+    if (ctx.compassOn) { stopCompass(ctx); btn.textContent = "🔊 聴く"; return; }
+    var parts = (String(text).match(/[^。]*。|[^。]+$/g) || []).filter(function (x) { return x.replace(/\s/g, ""); }), gen = (ctx.cgen = (ctx.cgen || 0) + 1), i = 0;
+    if (!parts.length || !W.speechSynthesis) return;
+    ctx.compassOn = true; btn.textContent = "⏹ 止める";
+    try { W.speechSynthesis.cancel(); } catch (e) { }
+    function fin() { if (ctx.cgen !== gen) return; ctx.compassOn = false; var b = ctx.doc.getElementById("ymCompassBtn"); if (b) b.textContent = "🔊 聴く"; bgStopSoon(function () { return false; }); }
+    function next() {
+      if (ctx.cgen !== gen) return;
+      if (i >= parts.length) { fin(); return; }
+      var ut = new W.SpeechSynthesisUtterance(ttsPrep(ctx, parts[i++]));
+      pickVoice(ut); ut.rate = ctx.rate;
+      var called = false;
+      function go() { if (called) return; called = true; setTimeout(next, 10); }
+      ut.onend = go; ut.onerror = function (ev) { if (ev && (ev.error === "interrupted" || ev.error === "canceled")) return; ctx.compassOn = false; fin(); };
+      try { W.speechSynthesis.speak(ut); } catch (e) { fin(); }
+    }
+    bgStart();
+    setTimeout(next, 80);
+  }
+
+  function startListening(ctx, plan) {
+    stopCompass(ctx);
+    if (ctx.player) ctx.player.destroy();
+    ctx.sessionRead = 0; ctx.sessionUp = 0; ctx.sessionDown = 0; ctx.sessionPlan = plan; ctx.metaKey = ""; ctx.fullKey = "";
+    renderListen(ctx);
+    var p = W.YMPlayer.create({
+      items: plan.session, listen: W.YMListen, synth: W.speechSynthesis,
+      newUtterance: function (t) { return new W.SpeechSynthesisUtterance(t); },
+      voice: pickVoice, prep: function (t) { return ttsPrep(ctx, t); }, rate: ctx.rate,
+      bg: { start: bgStart, stopSoon: function () { bgStopSoon(function () { return ctx.player && ctx.player.state().playing; }); } },
+      onChange: function (st) { updateListen(ctx, st); },
+      onCardEnd: function (e) { markRead(ctx, e.card); },
+      onFinish: function () { announceEnd(ctx); renderEnd(ctx); },
+      onError: function (why) { toast(ctx, "読み上げできませんでした(" + why + ")。▶ で再開できます", true); }
+    });
+    ctx.player = p;
+    if (ctx.pinKey) p.setPin(ctx.pinKey);
+    setMediaSession(ctx);
+    updateListen(ctx, p.state());
+    p.play();      // 「▶ 聴く」を押した操作の中で始める(iOSは、押した操作の中でないと音を出せない)
+  }
+
+  function boot(doc) {
+    var root = doc.getElementById("ym-root");
+    var style = doc.createElement("style"); style.textContent = CSS; doc.head.appendChild(style);
+    root.className = "ym";
+    function say(t) { root.innerHTML = ""; root.appendChild(el(doc, "pre", "", t)); }
+    say("index.html を読み込み中…");
+    // 画面に戻ってきたとき、読み上げ中なら画面スリープ抑止を取り直す(タブが隠れると自動で解放されるため)。
+    doc.addEventListener("visibilitychange", function () {
+      if (doc.visibilityState === "visible" && W.ymCtx && W.ymCtx.player && W.ymCtx.player.state().playing) bgStart();
+    });
+    W.fetch("index.html", { cache: "no-cache" }).then(function (r) {
+      if (!r.ok) throw new Error("HTTP " + r.status);
+      return r.text();
+    }).then(function (html) {
+      var d = W.YMBeta.extractData(html);
+      if (!d) { say("index.html にデータの目印がありません。公開バッチを一度実行してください。"); return; }
+      var ctx = buildCtx(doc, d, html);
+      ctx.root = root;
+      W.ymCtx = ctx;
+      renderHome(ctx);
+    }).catch(function (e) { say("読み込みに失敗しました: " + e); });
+  }
+
+  return { boot: boot, _plainBlocks: plainBlocks };
+});
+</script>
+<script>YMApp.boot(document);</script>
+</body></html>
