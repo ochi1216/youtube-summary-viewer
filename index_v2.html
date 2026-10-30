@@ -2162,9 +2162,34 @@
     writeOld(pairs);
   }
 
+  // サマリーの種類(ファイル名の summary_<種類>_ から)。Short / BBT / RSS / S など。
+  function typeOfFile(filename) {
+    var m = /^summary_([^_]+)_/i.exec(filename || "");
+    return m ? m[1] : "";
+  }
+  // 種類ごとの未読(全期間)。多い順。
+  function typeStats(ctx) {
+    var map = {}, out = [], i, t, k;
+    for (i = 0; i < ctx.cards.length; i++) {
+      if (isReadCard(ctx, ctx.cards[i]) || (ctx.cards[i].item && ctx.cards[i].item.is_error)) continue;
+      t = typeOfFile(ctx.cards[i].filename);
+      if (!t) continue;
+      map[t] = (map[t] || 0) + 1;
+    }
+    for (k in map) if (Object.prototype.hasOwnProperty.call(map, k)) out.push({ type: k, unread: map[k] });
+    out.sort(function (a, b) { return b.unread - a.unread; });
+    return out;
+  }
+
   function makePlan(ctx) {
-    return W.YMListen.plan(ctx.cards, {
-      order: ctx.order, listenDepth: W.ListenDepth, rate: ctx.rate, checkedFiles: checkedMap(ctx),
+    var cards = ctx.cards, checked = checkedMap(ctx), i;
+    // 種類を絞って聴く間は、その種類の未読を全期間から集める(聴くサマリーのチェックは見ない)。
+    if (ctx.focusType) {
+      cards = []; checked = {};
+      for (i = 0; i < ctx.cards.length; i++) if (typeOfFile(ctx.cards[i].filename).toLowerCase() === ctx.focusType.toLowerCase()) cards.push(ctx.cards[i]);
+    }
+    return W.YMListen.plan(cards, {
+      order: ctx.order, listenDepth: W.ListenDepth, rate: ctx.rate, checkedFiles: checked,
       isRead: function (c) { return isReadCard(ctx, c); }
     });
   }
@@ -2360,6 +2385,30 @@
     row.appendChild(ob);
     row.appendChild(selectEl(doc, rateOptions(), ctx.rate, function (v) { ctx.rate = parseFloat(v); lsSet("ymBetaRate", v); renderHome(ctx); }));
     root.appendChild(row);
+
+    // 種類を絞って聴く(その場かぎり。元に戻すと今日の未読の通常の状態に戻る)
+    var tstats = typeStats(ctx);
+    if (ctx.focusType) {
+      var fb = el(doc, "div", "compass");
+      fb.appendChild(el(doc, "div", "eyebrow", "🎯 絞り込み中"));
+      fb.appendChild(el(doc, "div", "t", ctx.focusType + " の未読だけを聴きます(全期間・" + plan.total + "件)"));
+      var back = el(doc, "button", "btn", "↩ 元に戻す"); back.id = "ymFocusOff";
+      back.addEventListener("click", function () { ctx.focusType = ""; renderHome(ctx); });
+      fb.appendChild(back);
+      root.appendChild(fb);
+    }
+    if (tstats.length) {
+      root.appendChild(el(doc, "div", "eyebrow", "種類を選んで聴く(未読件数)"));
+      var trow = el(doc, "div", "row");
+      for (i = 0; i < tstats.length; i++) (function (ts) {
+        var on = ctx.focusType && ctx.focusType.toLowerCase() === ts.type.toLowerCase();
+        var tb = el(doc, "button", "chip" + (on ? " on" : ""), ts.type + " " + ts.unread);
+        tb.setAttribute("data-type", ts.type);
+        tb.addEventListener("click", function () { ctx.focusType = on ? "" : ts.type; renderHome(ctx); });
+        trow.appendChild(tb);
+      })(tstats[i]);
+      root.appendChild(trow);
+    }
 
     // 今日届いたサマリー(人の言葉の見出し・未読/カード数・聴くかどうかのチェック)
     var stats = fileStats(ctx), t0 = ymb.startOfDay(now), todays = [];
