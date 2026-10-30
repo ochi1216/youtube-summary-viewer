@@ -2212,11 +2212,20 @@
     close.addEventListener("click", function () { closeSheet(ctx); });
     sh.appendChild(close);
     if (title) sh.appendChild(el(doc, "h2", "", title));
+    sh.style.top = "";
     sh.className = "sheet show";
     sh.scrollTop = 0;
     return sh;
   }
-  function closeSheet(ctx) { ctx.sheet.className = "sheet"; ctx.sheet.setAttribute("data-mode", ""); }
+  function closeSheet(ctx) { ctx.sheet.className = "sheet"; ctx.sheet.setAttribute("data-mode", ""); ctx.sheet.style.top = ""; }
+  // 全文表示の上端を、聴くカードのサムネイルの下端に合わせる(サムネイルを隠さない)。サムネイルが無い/画面の下の方なら既定の位置。
+  function placeFull(ctx) {
+    var sh = ctx.sheet, ui = ctx.ui, r, vh = ctx.win ? ctx.win.innerHeight : W.innerHeight;
+    sh.style.top = "";
+    if (!ui || !ui.thumb || ui.thumb.style.display === "none") return;
+    r = ui.thumb.getBoundingClientRect();
+    if (r.height > 0 && r.bottom > 0 && r.bottom < vh * 0.6) sh.style.top = Math.ceil(r.bottom) + "px";
+  }
 
   function selectEl(doc, opts, cur, onChange) {
     var s = el(doc, "select"), i;
@@ -2476,6 +2485,7 @@
       foot.appendChild(a);
     }
     sh.appendChild(foot);
+    placeFull(ctx);
   }
 
   function updateFullHighlight(ctx, st) {
