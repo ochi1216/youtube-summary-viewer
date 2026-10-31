@@ -1897,6 +1897,24 @@
     ".ym .compass .t{font-size:1.05rem;font-weight:bold;line-height:1.5}",
     ".ym .big{display:block;width:100%;min-height:72px;font-size:1.2rem;font-weight:bold;border:0;border-radius:14px;background:#3b6ab0;color:#fff;margin:12px 0}",
     ".ym .big:disabled{background:#a0aec0}",
+    ".ym .bigrow{display:flex;gap:8px;margin:12px 0}.ym .bigrow .big{margin:0;flex:1.4}.ym .bigrow .skimbig{flex:1;min-height:72px;font-size:1.1rem;font-weight:bold;border-radius:14px;border:2px solid #3b6ab0;background:#fff;color:#3b6ab0}.ym .bigrow .skimbig:disabled{border-color:#a0aec0;color:#a0aec0}",
+    ".ym.skim{padding-bottom:calc(230px + env(safe-area-inset-bottom))}",
+    ".ym .skh{align-items:center;margin-bottom:8px}.ym .skl{display:flex;gap:10px;align-items:center}",
+    ".ym .ring{width:48px;height:48px;border-radius:50%;background:conic-gradient(#3b6ab0 0 100%,#e2e8f0 0);display:flex;align-items:center;justify-content:center;flex:none}",
+    ".ym .ring i{width:37px;height:37px;border-radius:50%;background:#fff;display:flex;align-items:center;justify-content:center;font-style:normal;font-weight:700;color:#3b6ab0;font-size:.85rem}",
+    ".ym .skt{display:flex;flex-direction:column;align-items:flex-start;font-size:.8rem;color:#c05621;font-weight:700;line-height:1.3}",
+    ".ym .skq{border:0;background:none;color:#4a5568;font-size:.8rem;padding:2px 0;font-weight:400}",
+    ".ym .secs{display:flex;gap:4px;align-items:center;font-size:.8rem;color:#718096}",
+    ".ym .skcard .ptext{flex:1 1 auto;height:auto;min-height:0}",
+    ".ym .mini{display:flex;gap:10px;align-items:center;background:#fff;border:1px solid #e2e8f0;border-radius:12px;padding:10px;margin:8px 0}",
+    ".ym .mini img{width:96px;height:54px;object-fit:cover;border-radius:6px;flex:none;background:#e2e8f0}",
+    ".ym .mini .x{font-size:.9rem;line-height:1.4;flex:1;min-width:0;max-height:2.8em;overflow:hidden}.ym .mini small{display:block;color:#718096;font-size:.75rem}",
+    ".ym .mini.m1{opacity:.6}.ym .mini.m2{opacity:.4}",
+    ".ym .skdock{position:fixed;left:0;right:0;bottom:0;background:#f7fafc;box-shadow:0 -6px 10px -4px rgba(0,0,0,.12);padding:10px 16px calc(14px + env(safe-area-inset-bottom));z-index:30}",
+    ".ym .skdock-in{max-width:640px;margin:0 auto}",
+    ".ym .skrow{display:flex;gap:8px;margin:0 0 10px}.ym .skrow:last-child{margin-bottom:0}",
+    ".ym .skrow button{flex:1;min-height:76px;font-size:1.15rem;border-radius:16px;border:1px solid #cbd5e0;background:#fff;color:#2d3748}",
+    ".ym .skrow button.m{flex:1.6;background:#3b6ab0;color:#fff;border-color:#3b6ab0}.ym .skrow button.l{color:#3b6ab0;border:2px solid #3b6ab0}",
     ".ym .chip{font-size:.95rem;padding:8px 12px;border-radius:999px;border:1px solid #cbd5e0;background:#fff;color:#2d3748}",
     ".ym .chip.on{background:#3b6ab0;color:#fff;border-color:#3b6ab0}",
     ".ym .btn{font-size:.95rem;padding:12px 14px;border-radius:10px;border:1px solid #cbd5e0;background:#fff;color:#2d3748;text-decoration:none;display:inline-block;min-height:20px}",
@@ -2181,7 +2199,7 @@
     return out;
   }
 
-  function makePlan(ctx) {
+  function makePlan(ctx, all) {
     var cards = ctx.cards, checked = checkedMap(ctx), i;
     // 種類を絞って聴く間は、その種類の未読を全期間から集める(聴くサマリーのチェックは見ない)。
     if (ctx.focusType) {
@@ -2189,7 +2207,7 @@
       for (i = 0; i < ctx.cards.length; i++) if (typeOfFile(ctx.cards[i].filename).toLowerCase() === ctx.focusType.toLowerCase()) cards.push(ctx.cards[i]);
     }
     return W.YMListen.plan(cards, {
-      order: ctx.order, listenDepth: W.ListenDepth, rate: ctx.rate, checkedFiles: checked,
+      order: ctx.order, listenDepth: W.ListenDepth, rate: ctx.rate, checkedFiles: checked, limitSec: all ? Infinity : undefined,
       isRead: function (c) { return isReadCard(ctx, c); }
     });
   }
@@ -2369,13 +2387,18 @@
     var b = el(doc, "button", "big", plan.session.length ? ("▶ 聴く " + plan.session.length + "件・" + W.YMListen.minutesLabel(plan.sec)) : "聴く未読がありません");
     b.disabled = !plan.session.length;
     b.addEventListener("click", function () { startListening(ctx, plan); });
-    root.appendChild(b);
+    var sb = el(doc, "button", "skimbig", "👁 流し読み"); sb.id = "ymSkimBtn";
+    sb.disabled = !plan.total;
+    sb.addEventListener("click", function () { startSkim(ctx); });
+    var brow = el(doc, "div", "bigrow"); brow.appendChild(b); brow.appendChild(sb);
+    root.appendChild(brow);
 
     var cnt = {}, q, parts = [], k;
     for (q = 0; q < plan.session.length; q++) cnt[plan.session[q].name] = (cnt[plan.session[q].name] || 0) + 1;
     for (k in cnt) if (Object.prototype.hasOwnProperty.call(cnt, k)) parts.push(k + " " + cnt[k]);
     var info = "未読 " + unreadCount(ctx, false) + "件(今日の新着 " + unreadCount(ctx, true) + "件)・今回に入らない未読 " + plan.rest + "件\n" +
-      "深さ(自動): " + (parts.join(" / ") || "-") + "\n" + ctx.rate + "倍速の見積もり。15分で区切ります。";
+      "深さ(自動): " + (parts.join(" / ") || "-") + "\n" + ctx.rate + "倍速の見積もり。15分で区切ります。\n" +
+      "流し読み: 未読 " + plan.total + "件を " + skimSecsPref() + "秒ずつ → 約" + skimMinLabel(plan.total * skimSecsPref()) + "(音声なし)";
     if (!ctx.saved) info += "\n※既読を保存できませんでした(ブラウザの保存制限)";
     root.appendChild(el(doc, "pre", "", info));
 
@@ -3067,6 +3090,213 @@
     }
     bgStart();
     setTimeout(next, 80);
+  }
+
+  // ---- 流し読み(音声なし。1カードを数秒ずつ見せ、表示したカードは既読にする) ----
+  function skimSecsPref() { var v = parseFloat(lsGet("ymBetaSkimSec")); return (v === 1 || v === 2 || v === 3) ? v : 2; }
+  function skimMinLabel(sec) { var m = Math.floor(sec / 60), r = Math.round(sec % 60); return m ? (m + "分" + (r ? r + "秒" : "")) : (r + "秒"); }
+
+  function stopSkim(ctx) {
+    var sk = ctx.skim;
+    if (sk && sk.timer) { W.clearInterval(sk.timer); sk.timer = null; }
+  }
+
+  // 表示したカードを既読にする(取り消し用に、今回新しく既読にしたものを覚えておく)。
+  function skimMark(ctx, sk, card) {
+    var same, i;
+    if (sk.seen[card.key]) return;
+    sk.seen[card.key] = true;
+    if (ctx.read[card.key]) return;
+    sk.keys.push(card.key);
+    markRead(ctx, card);
+    same = ctx.byKey[card.key] || [card];
+    for (i = 0; i < same.length; i++) sk.pairs.push([same[i].filename, same[i].iIdx]);
+  }
+
+  function skimUndo(ctx, sk) {
+    var ymb = W.YMBeta;
+    ctx.read = ymb.unmark(ctx.read, sk.keys); persistRead(ctx);
+    var t = ymb.removeOldRead(lsGet(ymb.OLD_STATE_KEY), sk.pairs);
+    if (t !== null) lsSet(ymb.OLD_STATE_KEY, t);
+  }
+
+  function skimText(it) {
+    var t = W.YMListen.stripHtml(it.summary || "") || W.YMListen.stripHtml(it.conclusion || "") || W.YMListen.stripHtml(it.title || "");
+    return t.replace(/^\d+番。\s*/, "");
+  }
+
+  function startSkim(ctx) {
+    var plan = makePlan(ctx, true);
+    if (!plan.session.length) return;
+    stopCompass(ctx);
+    if (ctx.player) { ctx.player.destroy(); ctx.player = null; }
+    stopSkim(ctx);
+    ctx.skim = { entries: plan.session, idx: 0, secs: skimSecsPref(), left: 0, paused: false, last: Date.now(), timer: null, keys: [], pairs: [], seen: {}, ui: null };
+    renderSkim(ctx);
+    showSkimCard(ctx, 0);
+    ctx.skim.timer = W.setInterval(function () { skimTick(ctx); }, 100);
+  }
+
+  function peekEl(doc, cls) {
+    var d = el(doc, "div", "mini " + cls), im = el(doc, "img"), x = el(doc, "div", "x");
+    im.alt = "";
+    d.appendChild(im); d.appendChild(x); x.appendChild(el(doc, "span")); x.appendChild(el(doc, "small"));
+    return d;
+  }
+
+  function renderSkim(ctx) {
+    var doc = ctx.doc, root = ctx.root, sk = ctx.skim, ui = {}, i;
+    root.innerHTML = "";
+    root.className = "ym skim";
+    ctx.ui = null;
+    sk.ui = ui;
+    ui.head = el(doc, "div", "meta skh");
+    var left = el(doc, "div", "skl");
+    ui.ring = el(doc, "div", "ring"); ui.ringN = el(doc, "i"); ui.ring.appendChild(ui.ringN);
+    var lab = el(doc, "div", "skt");
+    ui.label = el(doc, "span", "", "👁 流し読み"); ui.pos = el(doc, "span");
+    ui.quit = el(doc, "button", "skq", "✕ 終わる");
+    ui.quit.addEventListener("click", function () { skimQuit(ctx); });
+    lab.appendChild(ui.label); lab.appendChild(ui.pos); lab.appendChild(ui.quit);
+    left.appendChild(ui.ring); left.appendChild(lab);
+    var secs = el(doc, "div", "secs");
+    ui.secB = {};
+    for (i = 0; i < 3; i++) (function (s) {
+      var b = el(doc, "button", "chip", String(s));
+      b.setAttribute("data-sec", String(s));
+      b.addEventListener("click", function () {
+        sk.secs = s; lsSet("ymBetaSkimSec", String(s));
+        sk.left = s * 1000; sk.last = Date.now();
+        skimPaint(ctx);
+      });
+      ui.secB[s] = b; secs.appendChild(b);
+    })(i + 1);
+    secs.appendChild(el(doc, "span", "", "秒"));
+    ui.head.appendChild(left); ui.head.appendChild(secs);
+    root.appendChild(ui.head);
+    var bar = el(doc, "div", "bar"); ui.fill = el(doc, "i"); bar.appendChild(ui.fill); root.appendChild(bar);
+
+    ui.card = el(doc, "div", "card skcard");
+    ui.thumb = el(doc, "img", "thumb"); ui.thumb.alt = "";
+    ui.badges = el(doc, "div", "badges");
+    ui.score = el(doc, "span", "score"); ui.chan = el(doc, "span", "chan");
+    ui.badges.appendChild(ui.score); ui.badges.appendChild(ui.chan);
+    ui.title = el(doc, "h2"); ui.ptext = el(doc, "div", "ptext");
+    ui.card.appendChild(ui.thumb); ui.card.appendChild(ui.badges); ui.card.appendChild(ui.title); ui.card.appendChild(ui.ptext);
+    root.appendChild(ui.card);
+    ui.p1 = peekEl(doc, "m1"); ui.p2 = peekEl(doc, "m2");
+    root.appendChild(ui.p1); root.appendChild(ui.p2);
+
+    var dock = el(doc, "div", "skdock"), din = el(doc, "div", "skdock-in");
+    var r1 = el(doc, "div", "skrow"), r2 = el(doc, "div", "skrow");
+    ui.prev = el(doc, "button", "", "⏮"); ui.toggle = el(doc, "button", "m", "⏸ 止める"); ui.next = el(doc, "button", "", "⏭");
+    ui.prev.addEventListener("click", function () { if (sk.idx > 0) showSkimCard(ctx, sk.idx - 1); });
+    ui.next.addEventListener("click", function () { if (sk.idx < sk.entries.length - 1) showSkimCard(ctx, sk.idx + 1); else finishSkim(ctx); });
+    ui.toggle.addEventListener("click", function () { sk.paused = !sk.paused; sk.last = Date.now(); skimPaint(ctx); });
+    ui.listen = el(doc, "button", "l", "🔊 ここから聴く");
+    ui.listen.addEventListener("click", function () { skimListen(ctx); });
+    r1.appendChild(ui.prev); r1.appendChild(ui.toggle); r1.appendChild(ui.next); r2.appendChild(ui.listen);
+    din.appendChild(r1); din.appendChild(r2); dock.appendChild(din); root.appendChild(dock);
+    ensureOverlays(ctx);
+  }
+
+  function fillPeek(p, e) {
+    var im = p.firstChild, x = p.lastChild;
+    if (!e) { p.style.display = "none"; return; }
+    var it = e.card.item;
+    p.style.display = "";
+    if (it.thumbnail) { if (im.getAttribute("src") !== it.thumbnail) im.src = it.thumbnail; im.style.visibility = ""; } else { im.removeAttribute("src"); im.style.visibility = "hidden"; }
+    x.firstChild.textContent = W.YMListen.stripHtml(it.title);
+    var sc = it.ai && typeof it.ai.s === "number" ? it.ai.s : null;
+    x.lastChild.textContent = (channelName(it) || "") + (sc === null ? "" : ((channelName(it) ? "・" : "") + sc));
+  }
+
+  // 文の枠を、ちょうど整数行の高さにそろえる(最後の行が中途半端に切れない)。カードの高さは変えない。
+  function skimFit(ui) {
+    var t = ui.ptext;
+    t.style.flex = "1 1 auto"; t.style.height = "";
+    var h = t.clientHeight, lh = parseFloat(W.getComputedStyle(t).lineHeight) || 25.6, n = Math.floor((h - 8) / lh);
+    if (n >= 2) { t.style.flex = "none"; t.style.height = (n * lh + 8) + "px"; }
+  }
+
+  function showSkimCard(ctx, i) {
+    var sk = ctx.skim, ui = sk.ui, e = sk.entries[i], it = e.card.item;
+    sk.idx = i; sk.left = sk.secs * 1000; sk.last = Date.now();
+    skimMark(ctx, sk, e.card);
+    ui.card.className = "card skcard" + (isStarred(it) ? " star" : "");
+    if (it.thumbnail) { if (ui.thumb.getAttribute("src") !== it.thumbnail) ui.thumb.src = it.thumbnail; ui.thumb.style.display = ""; }
+    else ui.thumb.style.display = "none";
+    var sc = it.ai && typeof it.ai.s === "number" ? it.ai.s : null;
+    ui.score.textContent = sc === null ? "" : String(sc);
+    ui.score.className = "score" + (sc === null ? "" : " s" + sc);
+    ui.score.style.display = sc === null ? "none" : "";
+    ui.chan.textContent = channelName(it) + (it.duration ? (channelName(it) ? "・" : "") + it.duration : "");
+    ui.title.textContent = W.YMListen.stripHtml(it.title);
+    ui.ptext.textContent = skimText(it); ui.ptext.scrollTop = 0;
+    skimFit(ui);
+    fillPeek(ui.p1, sk.entries[i + 1]); fillPeek(ui.p2, sk.entries[i + 2]);
+    skimPaint(ctx);
+  }
+
+  function skimPaint(ctx) {
+    var sk = ctx.skim, ui = sk.ui, total = sk.secs * 1000, pct = Math.max(0, Math.min(100, 100 * sk.left / total)), s;
+    if (!ui) return;
+    ui.ring.style.background = "conic-gradient(#3b6ab0 0 " + pct + "%,#e2e8f0 0)";
+    ui.ringN.textContent = (Math.max(0, sk.left) / 1000).toFixed(1);
+    ui.label.textContent = sk.paused ? "👁 流し読み 停止中" : "👁 流し読み";
+    ui.pos.textContent = (sk.idx + 1) + " / " + sk.entries.length;
+    ui.fill.style.width = Math.round(100 * sk.idx / Math.max(1, sk.entries.length)) + "%";
+    ui.toggle.textContent = sk.paused ? "▶ 再開" : "⏸ 止める";
+    for (s in ui.secB) if (Object.prototype.hasOwnProperty.call(ui.secB, s)) ui.secB[s].className = "chip" + (Number(s) === sk.secs ? " on" : "");
+  }
+
+  function skimTick(ctx) {
+    var sk = ctx.skim, now = Date.now();
+    if (!sk || !sk.ui) return;
+    if (sk.paused) { sk.last = now; return; }
+    sk.left -= now - sk.last; sk.last = now;
+    if (sk.left > 0) { skimPaint(ctx); return; }
+    if (sk.idx < sk.entries.length - 1) showSkimCard(ctx, sk.idx + 1); else finishSkim(ctx);
+  }
+
+  function skimQuit(ctx) {
+    var sk = ctx.skim, n = sk.keys.length;
+    stopSkim(ctx);
+    renderHome(ctx);
+    if (n) toast(ctx, "流し読みで " + n + "件を既読にしました", false, {
+      label: "取り消す", ms: 8000,
+      run: function () { skimUndo(ctx, sk); renderHome(ctx); toast(ctx, "取り消しました", false); }
+    });
+  }
+
+  function finishSkim(ctx) {
+    var doc = ctx.doc, root = ctx.root, sk = ctx.skim, n = sk.keys.length;
+    stopSkim(ctx);
+    root.innerHTML = "";
+    root.className = "ym";
+    root.appendChild(el(doc, "h1", "", "最後まで流し読みしました"));
+    root.appendChild(el(doc, "pre", "", "表示した " + n + "件を既読にしました"));
+    if (n) {
+      var un = el(doc, "button", "big", "↩ 既読を取り消す"); un.id = "ymSkimUndo";
+      un.addEventListener("click", function () { skimUndo(ctx, sk); renderHome(ctx); toast(ctx, "取り消しました", false); });
+      root.appendChild(un);
+    }
+    var hb = el(doc, "button", "chip", "ホームへ"); hb.id = "ymSkimHome";
+    hb.addEventListener("click", function () { renderHome(ctx); });
+    root.appendChild(hb);
+    ensureOverlays(ctx);
+  }
+
+  // 流し読みをやめて、いま見ているカードから通常の聴くモードに移る。
+  function skimListen(ctx) {
+    var sk = ctx.skim, i, sec = 0, session = [], lim = W.YMListen.LIMIT_SEC, e;
+    stopSkim(ctx);
+    for (i = sk.idx; i < sk.entries.length; i++) {
+      e = sk.entries[i];
+      if (session.length && sec + e.sec > lim) break;
+      session.push(e); sec += e.sec;
+    }
+    startListening(ctx, { session: session, sec: sec, total: sk.entries.length - sk.idx, rest: sk.entries.length - sk.idx - session.length });
   }
 
   function startListening(ctx, plan) {
