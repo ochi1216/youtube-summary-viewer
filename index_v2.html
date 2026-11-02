@@ -1226,6 +1226,142 @@
     return out;
   }
 
+  // 改行を残した平文。要旨・結論の表示と、文ごとの読み上げの元になる。
+  function plainBlocks(html) {
+    return String(html || "").replace(/<\/(li|p|div|h[1-6]|ul|ol)>/gi, "\n").replace(/<br\s*\/?>/gi, "\n")
+      .replace(/<[^>]*>/g, "").replace(/&nbsp;/g, " ").replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">")
+      .replace(/&quot;/g, "\"").replace(/&#39;/g, "'").replace(/\n{3,}/g, "\n\n").replace(/^\s+|\s+$/g, "");
+  }
+
+  // ---- 文ごとの読み上げ・強調 ----
+  // 表示(全文シート)も読み上げ(プレイヤー)も、segsOf が返す同じ配列を使う。別々に分割しない。
+  var MIN_SEG = 10;
+  var ENDERS = "。！？!?";
+  var CLOSERS = "」』）)】”\"’'";
+
+  // 文に分ける。「。！？」と改行で区切り、閉じ括弧は前の文に付ける。約10字未満の断片は次の文へ(末尾なら前の文へ)つなぐ。
+  // 改行で区切った所は、次の文の頭に "\n" を残す(表示用。読み上げでは外す)。後読み正規表現は古いiOSで使えないので手書き。
+  function splitSentences(text) {
+    var s = String(text || ""), raw = [], cur = "", nl = false, i, ch;
+    function flush() {
+      var t = cur.replace(/^\s+|\s+$/g, "");
+      if (t) { raw.push((nl && raw.length ? "\n" : "") + t); nl = false; }
+      cur = "";
+    }
+    for (i = 0; i < s.length; i++) {
+      ch = s.charAt(i);
+      if (ch === "\n") { flush(); nl = true; continue; }
+      cur += ch;
+      if (ENDERS.indexOf(ch) >= 0) {
+        while (i + 1 < s.length && (ENDERS.indexOf(s.charAt(i + 1)) >= 0 || CLOSERS.indexOf(s.charAt(i + 1)) >= 0)) { i++; cur += s.charAt(i); }
+        flush();
+      }
+    }
+    flush();
+    var out = [], pend = "", k, f, t2;
+    for (k = 0; k < raw.length; k++) {
+      f = raw[k];
+      t2 = pend + f;
+      if (k < raw.length - 1 && t2.replace(/\s/g, "").length < MIN_SEG) { pend = t2; continue; }
+      pend = "";
+      if (k === raw.length - 1 && t2.replace(/\s/g, "").length < MIN_SEG && out.length) out[out.length - 1] += t2;
+      else out.push(t2);
+    }
+    return out;
+  }
+
+  function endsWithPunct(t) { return !!t && (ENDERS.indexOf(t.charAt(t.length - 1)) >= 0); }
+
+  // 主なポイントを、大項目(h1)・箇条(li: 中項目 head + 本文 body)・ただの文(text)に分ける。
+  // [{kind, head, body}]。DOMParser が無い環境(node)では平文1つにする。判定は構造(strong / li)で、style の文字列には頼らない。
+  function pointBlocks(html) {
+    var out = [];
+    try {
+      if (typeof DOMParser === "undefined") throw new Error("no DOMParser");
+      var dom = new DOMParser().parseFromString("<body>" + String(html || "") + "</body>", "text/html");
+      var clean = function (x) { return String(x || "").replace(/\s+/g, " ").replace(/^\s+|\s+$/g, ""); };
+      var isHead = function (k) {
+        var tag = k.tagName.toLowerCase();
+        return (tag === "p" && /fw-bold/.test(k.className || "")) || /^h[1-6]$/.test(tag) || /2b6cb0/i.test(k.getAttribute("style") || "");
+      };
+      var liGroup = function (li) {
+        var full = clean(li.textContent), head = "", first = li.firstElementChild;
+        if (first && /^(strong|b)$/i.test(first.tagName)) {
+          var h = clean(first.textContent);
+          if (h && full.indexOf(h) === 0) head = h;
+        }
+        out.push({ kind: "li", head: head, body: clean(full.slice(head.length)) });
+      };
+      var walk = function (node) {
+        var kids = node.children, i, k, tag;
+        for (i = 0; i < kids.length; i++) {
+          k = kids[i]; tag = k.tagName.toLowerCase();
+          if (isHead(k)) { if (clean(k.textContent)) out.push({ kind: "h1", head: clean(k.textContent), body: "" }); }
+          else if (tag === "ul" || tag === "ol") {
+            var lis = k.children, j;
+            for (j = 0; j < lis.length; j++) if (lis[j].tagName.toLowerCase() === "li") liGroup(lis[j]);
+          }
+          else if ((tag === "strong" || tag === "b") && node !== dom.body) { if (clean(k.textContent)) out.push({ kind: "h1", head: clean(k.textContent), body: "" }); }
+          else if (k.querySelector && k.querySelector("ul,ol,strong,b,p.fw-bold")) walk(k);
+          else if (clean(k.textContent)) out.push({ kind: "text", head: "", body: clean(k.textContent) });
+        }
+      };
+      walk(dom.body);
+      if (!out.length) throw new Error("empty");
+      return out;
+    } catch (e) {
+      var t = stripHtml(html);
+      return t ? [{ kind: "text", head: "", body: t }] : [];
+    }
+  }
+
+  var segCache = {}, segCount = 0;
+
+  // 深さ depth で読む部分ごとの文の一覧。parts() と同じ並び・同じ条件。
+  // [{part, segs:[{text(読む文), show(表示する文), kind, b(まとまり番号), bullet}]}]
+  //   kind: title | lead | body | h1 | h2 | li | text   lead は「結論。」「主なポイント。」の呼びかけ(表示は見出しに任せる)
+  function segsOf(item, depth, pos) {
+    item = item || {};
+    var key = [depth, pos || 0, item.title, item.summary, item.conclusion, item.points].join("\u0001");
+    if (segCache[key]) return segCache[key];
+    var out = [], b = 0;
+    function plain(part, html, lead) {
+      var segs = [], sents = splitSentences(plainBlocks(html)), i, bi = ++b;
+      if (lead) segs.push({ text: lead, show: "", kind: "lead", b: 0, bullet: false });
+      for (i = 0; i < sents.length; i++) segs.push({ text: sents[i].replace(/\n+/g, ""), show: sents[i], kind: "body", b: bi, bullet: false });
+      out.push({ part: part, segs: segs });
+    }
+    var title = stripHtml(item.title);
+    out.push({ part: "title", segs: [{ text: (pos ? pos + "番。 " : "") + title, show: title, kind: "title", b: ++b, bullet: false }] });
+    if (depth <= 3 && item.summary) plain("summary", item.summary, "");
+    if (depth <= 2 && item.conclusion) plain("conclusion", item.conclusion, "結論。");
+    if (depth <= 1 && item.points && stripHtml(item.points)) {
+      var segs = [{ text: "主なポイント。", show: "", kind: "lead", b: 0, bullet: false }], bl = pointBlocks(item.points), i, j;
+      for (i = 0; i < bl.length; i++) {
+        var g = bl[i], bi = ++b, first = true;
+        if (g.kind === "h1") {
+          var h1 = g.head.replace(/^[■□●◆◇▶▷]\s*/, "").replace(/[:：]\s*$/, "");
+          segs.push({ text: endsWithPunct(h1) ? h1 : h1 + "。", show: g.head, kind: "h1", b: bi, bullet: false });
+          continue;
+        }
+        if (g.head) {
+          var h2 = g.head.replace(/[:：]\s*$/, "");
+          segs.push({ text: endsWithPunct(h2) ? h2 : h2 + "。", show: g.head, kind: "h2", b: bi, bullet: g.kind === "li" });
+          first = false;
+        }
+        var ss = splitSentences(g.body);
+        for (j = 0; j < ss.length; j++) {
+          segs.push({ text: ss[j].replace(/\n+/g, ""), show: ss[j], kind: g.kind === "li" ? "li" : "text", b: bi, bullet: first && g.kind === "li" });
+          first = false;
+        }
+      }
+      out.push({ part: "points", segs: segs });
+    }
+    if (segCount > 300) { segCache = {}; segCount = 0; }
+    segCache[key] = out; segCount++;
+    return out;
+  }
+
   function estimateSec(item, depth, rate) {
     var ps = parts(item, depth, 0), n = 0;
     for (var i = 0; i < ps.length; i++) n += ps[i].text.length;
@@ -1346,7 +1482,7 @@
 
   return {
     DEPTHS: DEPTHS, LIMIT_SEC: LIMIT_SEC, CHARS_PER_SEC: CHARS_PER_SEC,
-    byDepth: byDepth, byKey: byKey, stripHtml: stripHtml, parts: parts, estimateSec: estimateSec,
+    byDepth: byDepth, byKey: byKey, stripHtml: stripHtml, plainBlocks: plainBlocks, splitSentences: splitSentences, pointBlocks: pointBlocks, segsOf: segsOf, parts: parts, estimateSec: estimateSec,
     minutesLabel: minutesLabel, durLabel: durLabel, perDepth: perDepth, autoDepth: autoDepth, sortCards: sortCards, plan: plan, fileStamp: fileStamp
   };
 });
@@ -1394,7 +1530,7 @@
     var listen = o.listen;
     var setT = o.setTimer || function (f, ms) { return setTimeout(f, ms); };
     var clearT = o.clearTimer || function (t) { clearTimeout(t); };
-    var st = { i: 0, p: 0, playing: false, depthKey: null, pinKey: null, rate: (typeof o.rate === "number" && o.rate > 0) ? o.rate : 1, finished: false };
+    var st = { i: 0, p: 0, s: 0, playing: false, depthKey: null, pinKey: null, rate: (typeof o.rate === "number" && o.rate > 0) ? o.rate : 1, finished: false };
     var gen = 0, timer = null, cur = null, dead = false;
 
     function entry() { return items[st.i] || null; }
@@ -1417,10 +1553,18 @@
       return listen.parts(e.card.item, depthOf(e).depth, st.i + 1);
     }
 
+    // 部分ごとの文の一覧(表示も同じものを使う)。listen が文に分けられないとき(古い差し替え)は、部分ぜんぶを1文とする。
+    function segsFor(e) {
+      if (listen.segsOf) return listen.segsOf(e.card.item, depthOf(e).depth, st.i + 1);
+      var ps = partsFor(e), out = [], k;
+      for (k = 0; k < ps.length; k++) out.push({ part: ps[k].part, segs: [{ text: ps[k].text, show: ps[k].text, kind: "body", b: k + 1, bullet: false }] });
+      return out;
+    }
+
     function state() {
-      var e = entry();
+      var e = entry(), sg = e ? segsFor(e)[st.p] : null;
       return {
-        i: st.i, p: st.p, total: items.length, playing: st.playing, finished: st.finished,
+        i: st.i, p: st.p, s: st.s, seg: (sg && st.s < sg.segs.length) ? { part: sg.part, i: st.s } : null, total: items.length, playing: st.playing, finished: st.finished,
         rate: st.rate, depthKey: st.depthKey, pinKey: st.pinKey, remainingSec: remainingSec(), entry: e,
         depthName: e ? depthOf(e).name : "", auto: !st.depthKey,
         part: e ? (partsFor(e)[st.p] || null) : null
@@ -1447,7 +1591,7 @@
     function leaveCard(how) {
       var e = entry();
       if (e && o.onCardEnd) { try { o.onCardEnd(e, how); } catch (err) { } }
-      st.i++; st.p = 0; st.depthKey = null;
+      st.i++; st.p = 0; st.s = 0; st.depthKey = null;
       if (st.i >= items.length) { st.i = items.length; finishAll(); return false; }
       return true;
     }
@@ -1461,7 +1605,10 @@
         if (leaveCard("end")) { emit(); schedule(); }
         return;
       }
-      var text = ps[st.p].text;
+      // 部分の文を使い切った(または文が1つも無い部分)ときは、次の部分へ。
+      var sgs = segsFor(e)[st.p], segs = sgs ? sgs.segs : [];
+      if (st.s >= segs.length) { st.p++; st.s = 0; emit(); schedule(); return; }
+      var text = segs[st.s].text;
       try { if (o.prep) text = o.prep(text) || text; } catch (err) { }
       var ut = o.newUtterance(text);
       ut.rate = st.rate;
@@ -1470,7 +1617,7 @@
       function done() {
         if (handled || myGen !== gen || !st.playing) return;
         handled = true; cur = null;
-        st.p++;
+        st.s++;
         emit();
         schedule();
       }
@@ -1527,12 +1674,13 @@
         emit();
         if (st.playing) schedule();
       },
-      // 今のカードの頭へ。すでに頭なら前のカードへ。既読は取り消さない。
+      // 部分の途中なら1文前へ。部分の頭なら、そのカードの頭へ。すでに頭なら前のカードへ。既読は取り消さない。
       prev: function () {
         if (dead || st.finished) return;
         killCurrent();
-        if (st.p > 0) st.p = 0;
-        else if (st.i > 0) { st.i--; st.p = 0; st.depthKey = null; }
+        if (st.s > 0) st.s--;
+        else if (st.p > 0) st.p = 0;
+        else if (st.i > 0) { st.i--; st.p = 0; st.s = 0; st.depthKey = null; }
         emit();
         if (st.playing) schedule();
       },
@@ -1958,8 +2106,10 @@
     ".ym .sheet.show{display:block}",
     ".ym .sheet h3{margin:12px 0 4px;font-size:.95rem;color:#3b6ab0}",
     ".ym .sheet .sec{white-space:pre-wrap;line-height:1.7;font-size:1rem;border-radius:8px;padding:6px 8px;margin:2px 0}",
-    ".ym .sheet .sec.hl{background:#fef9c3}",
-    ".ym .sheet .ph{color:#2b6cb0;font-weight:700;margin-top:10px}.ym .sheet .ph:first-child{margin-top:0}.ym .sheet .pli{margin:2px 0 4px;color:#4a5568}",
+    ".ym .sheet .s{border-radius:4px;-webkit-box-decoration-break:clone;box-decoration-break:clone}",
+    ".ym .sheet .s.cur,.ym .sheet h3.cur{background:#fef9c3}",
+    ".ym .sheet .ph1{color:#2b6cb0;font-weight:700;margin-top:12px;line-height:1.6}.ym .sheet .ph1:first-child{margin-top:0}.ym .sheet .ph2{color:#3182ce;font-weight:700}",
+    ".ym .sheet .pli{margin:2px 0 6px;color:#4a5568;line-height:1.7}",
     ".ym .sheet .close{position:sticky;top:0;display:block;margin:0 0 8px auto;z-index:2;font-size:1rem;padding:8px 14px;border-radius:10px;border:1px solid #cbd5e0;background:#fff}",
     ".ym .sheet .foot{display:flex;gap:8px;margin:16px 0 4px}.ym .sheet .foot>*{flex:1;text-align:center;padding:14px 4px;border-radius:10px;border:1px solid #cbd5e0;background:#fff;color:#2d3748;text-decoration:none;font-size:1rem}",
     ".ym .opt{display:block;width:100%;text-align:left;padding:12px;margin:8px 0;border-radius:10px;border:2px solid #e2e8f0;background:#fff;font-size:1rem}",
@@ -1994,24 +2144,6 @@
     var i, d = ctx.data.ALL_DATA;
     for (i = 0; i < d.length; i++) if (d[i].filename === filename) return W.YMBeta.fileHeading(d[i]);
     return "";
-  }
-
-  // 主なポイント: 旧UIと同じく、小見出し(青の太字)と箇条書きに分けて出す。見出しが見つからなければ、ただの文にする。
-  function pointsBlocks(ctx, html, host) {
-    var doc = ctx.doc, n = 0;
-    try {
-      var dom = new W.DOMParser().parseFromString(String(html || ""), "text/html"), kids = dom.body.children, i;
-      for (i = 0; i < kids.length; i++) {
-        var k = kids[i], tag = k.tagName.toLowerCase();
-        var isHead = (tag === "p" && /fw-bold/.test(k.className)) || /^h[1-6]$/.test(tag) || /2b6cb0/i.test(k.getAttribute("style") || "");
-        if (isHead && tag !== "ul") { host.appendChild(el(doc, "div", "ph", k.textContent.replace(/^\s+|\s+$/g, ""))); n++; }
-        else if (tag === "ul" || tag === "ol") {
-          var lis = k.querySelectorAll("li"), j;
-          for (j = 0; j < lis.length; j++) host.appendChild(el(doc, "div", "pli", "・" + lis[j].textContent.replace(/^\s+|\s+$/g, "")));
-        } else if (k.textContent.replace(/\s/g, "")) host.appendChild(el(doc, "div", "pli", plainBlocks(k.innerHTML)));
-      }
-    } catch (e) { n = 0; }
-    if (!n) { host.innerHTML = ""; host.textContent = plainBlocks(html); }
   }
 
   function plainBlocks(html) {
@@ -2485,7 +2617,7 @@
   function ttsPrep(ctx, text) {
     if (!text) return text;
     ctx.lastSource = text;
-    if (ctx.hist[0] !== text) { ctx.hist.unshift(text); if (ctx.hist.length > 3) ctx.hist.length = 3; }
+    if (ctx.hist[0] !== text) { ctx.hist.unshift(text); if (ctx.hist.length > 8) ctx.hist.length = 8; }
     var out = text;
     if (W.TTSClean) {
       try {
@@ -2522,28 +2654,47 @@
     });
   }
 
-  // 全文シート: いま読んでいる部分を黄色で示す。開いている間も読み上げは続き、カードが進めば中身も替わる。
+  // 全文シート: いま読んでいる文を黄色で示す。開いている間も読み上げは続き、カードが進めば中身も替わる。
   function fullKey(st) { return st.entry ? st.entry.card.key + "|" + st.entry.card.filename + "_" + st.entry.card.iIdx : ""; }
 
+  // 文のまとまり(segs の b が同じ連続)ごとに1行にして、各文を span にする。読み上げが進むと、いまの文の span だけ黄色にする。
   function buildFull(ctx, st) {
-    var e = st.entry, it, doc = ctx.doc, sh = ctx.sheet, secs, i;
+    var e = st.entry, it, doc = ctx.doc, sh = ctx.sheet, i, j, all, lab = { summary: "要旨", conclusion: "結論", points: "主なポイント" };
     if (!e) return;
     it = e.card.item;
     sh.innerHTML = "";
     sh.setAttribute("data-mode", "full");
     ctx.fullKey = fullKey(st);
+    ctx.fullCur = ""; ctx.fullEl = null;
     var close = el(doc, "button", "close", "閉じる");
     close.addEventListener("click", function () { closeSheet(ctx); });
     sh.appendChild(close);
-    var t = el(doc, "h2", "sec", W.YMListen.stripHtml(it.title)); t.setAttribute("data-part", "title");
+    all = W.YMListen.segsOf(it, 1, st.i + 1);       // 深さによらず、ある部分はすべて出す
+    var t = el(doc, "h2", "sec s", W.YMListen.stripHtml(it.title)); t.setAttribute("data-part", "title"); t.setAttribute("data-seg", "0");
     sh.appendChild(t);
     if (channelName(it)) sh.appendChild(el(doc, "div", "chan", channelName(it)));
-    secs = [["要旨", it.summary, "summary"], ["結論", it.conclusion, "conclusion"], ["主なポイント", it.points, "points"]];
-    for (i = 0; i < secs.length; i++) {
-      if (!secs[i][1]) continue;
-      sh.appendChild(el(doc, "h3", "", secs[i][0]));
-      var d = el(doc, "div", "sec", secs[i][2] === "points" ? "" : plainBlocks(secs[i][1])); d.setAttribute("data-part", secs[i][2]);
-      if (secs[i][2] === "points") pointsBlocks(ctx, secs[i][1], d);
+    for (i = 0; i < all.length; i++) {
+      var pt = all[i];
+      if (pt.part === "title") continue;
+      var h3 = el(doc, "h3", "", lab[pt.part]); h3.setAttribute("data-lead", pt.part);
+      sh.appendChild(h3);
+      var d = el(doc, "div", "sec"); d.setAttribute("data-part", pt.part);
+      var row = null, lastB = -1, prevKind = "";
+      for (j = 0; j < pt.segs.length; j++) {
+        var sg = pt.segs[j];
+        if (sg.kind === "lead") continue;
+        if (pt.part === "points") {
+          if (!row || sg.b !== lastB) {
+            row = el(doc, "div", sg.kind === "h1" ? "ph1" : "pli");
+            if (sg.bullet) row.appendChild(doc.createTextNode("・"));
+            d.appendChild(row); lastB = sg.b;
+          } else if (prevKind === "h2") row.appendChild(doc.createTextNode(" "));
+        }
+        var sp = el(doc, "span", "s" + (sg.kind === "h2" ? " ph2" : ""), sg.show);
+        sp.setAttribute("data-part", pt.part); sp.setAttribute("data-seg", String(j));
+        (row && pt.part === "points" ? row : d).appendChild(sp);
+        prevKind = sg.kind;
+      }
       sh.appendChild(d);
     }
     var foot = el(doc, "div", "foot");
@@ -2559,12 +2710,26 @@
     placeFull(ctx);
   }
 
+  // いま読んでいる(止めているときは、再生を続ける)文だけ黄色にする。文が替わったときだけ付け替え、画面の外なら見える所まで動かす。
   function updateFullHighlight(ctx, st) {
     var sh = ctx.sheet;
     if (!sh || sh.getAttribute("data-mode") !== "full" || sh.className.indexOf("show") < 0) return;
-    if (ctx.fullKey !== fullKey(st)) { var top = sh.scrollTop; buildFull(ctx, st); sh.className = "sheet show"; sh.scrollTop = 0; }
-    var secs = sh.querySelectorAll(".sec"), i, cur = st.part ? st.part.part : "";
-    for (i = 0; i < secs.length; i++) secs[i].className = "sec" + (secs[i].getAttribute("data-part") === cur ? " hl" : "");
+    if (ctx.fullKey !== fullKey(st)) { buildFull(ctx, st); sh.className = "sheet show"; sh.scrollTop = 0; }
+    var sg = st.seg;
+    if (!sg) return;
+    var key = sg.part + "|" + sg.i;
+    if (ctx.fullCur === key) return;
+    ctx.fullCur = key;
+    if (ctx.fullEl) { ctx.fullEl.className = ctx.fullEl.className.replace(/ cur$/, ""); ctx.fullEl = null; }
+    var all = W.YMListen.segsOf(st.entry.card.item, 1, st.i + 1), k, kind = "", target = null;
+    for (k = 0; k < all.length; k++) if (all[k].part === sg.part) kind = all[k].segs[sg.i] ? all[k].segs[sg.i].kind : "";
+    if (kind === "lead") target = sh.querySelector("h3[data-lead=\"" + sg.part + "\"]");
+    else target = sh.querySelector("[data-part=\"" + sg.part + "\"][data-seg=\"" + sg.i + "\"]");
+    if (!target) return;
+    target.className += " cur";
+    ctx.fullEl = target;
+    var er = target.getBoundingClientRect(), sr = sh.getBoundingClientRect();
+    if (er.top < sr.top + 56 || er.bottom > sr.bottom - 24) sh.scrollTop += er.top - (sr.top + sr.height * 0.3);
   }
 
   function openFull(ctx) {
@@ -2892,7 +3057,7 @@
 
     sh.appendChild(el(doc, "h3", "", "直前に読み上げた文"));
     var histBox = el(doc, "div", "dhist");
-    var names = ["いま", "1つ前", "2つ前"];
+    var names = ["いま", "1つ前", "2つ前", "3つ前", "4つ前", "5つ前", "6つ前", "7つ前"];
     if (!ctx.hist.length) histBox.appendChild(el(doc, "div", "dnote", "まだ読み上げていません。言葉は手で入力できます。"));
     for (i = 0; i < ctx.hist.length; i++) {
       histBox.appendChild(el(doc, "div", "dlab", names[i]));
