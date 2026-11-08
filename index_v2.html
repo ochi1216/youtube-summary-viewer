@@ -2106,8 +2106,10 @@
     ".ym .sheet.show{display:block}",
     ".ym .sheet h3{margin:12px 0 4px;font-size:.95rem;color:#3b6ab0}",
     ".ym .sheet .sec{white-space:pre-wrap;line-height:1.7;font-size:1rem;border-radius:8px;padding:6px 8px;margin:2px 0}",
+    ".ym .sheet .pad{height:60vh}",
     ".ym .sheet .s{border-radius:4px;-webkit-box-decoration-break:clone;box-decoration-break:clone}",
-    ".ym .sheet .s.cur,.ym .sheet h3.cur{background:#fef9c3}",
+    ".ym .sheet .s.cur,.ym .sheet h3.cur{background:#fde047}",
+    ".ym .ptext{white-space:pre-wrap}.ym .ptext .s{border-radius:4px;-webkit-box-decoration-break:clone;box-decoration-break:clone}.ym .ptext .s.cur{background:#fcd34d}.ym .ptext .ppad{height:4.8rem}",
     ".ym .sheet .ph1{color:#2b6cb0;font-weight:700;margin-top:12px;line-height:1.6}.ym .sheet .ph1:first-child{margin-top:0}.ym .sheet .ph2{color:#3182ce;font-weight:700}",
     ".ym .sheet .pli{margin:2px 0 6px;color:#4a5568;line-height:1.7}",
     ".ym .sheet .close{position:sticky;top:0;display:block;margin:0 0 8px auto;z-index:2;font-size:1rem;padding:8px 14px;border-radius:10px;border:1px solid #cbd5e0;background:#fff}",
@@ -2707,6 +2709,7 @@
       foot.appendChild(a);
     }
     sh.appendChild(foot);
+    sh.appendChild(el(doc, "div", "pad"));          // 終わりの文も先頭まで寄せられるよう、下に余白を足す
     placeFull(ctx);
   }
 
@@ -2728,8 +2731,8 @@
     if (!target) return;
     target.className += " cur";
     ctx.fullEl = target;
-    var er = target.getBoundingClientRect(), sr = sh.getBoundingClientRect();
-    if (er.top < sr.top + 56 || er.bottom > sr.bottom - 24) sh.scrollTop += er.top - (sr.top + sr.height * 0.3);
+    var cb = sh.querySelector(".close"), er = target.getBoundingClientRect(), sr = sh.getBoundingClientRect();
+    sh.scrollTop += er.top - (sr.top + (cb ? cb.offsetHeight + 8 : 8) + 6);      // 読んでいる文を、閉じるボタンの下(先頭)に置く
   }
 
   function openFull(ctx) {
@@ -2864,6 +2867,41 @@
     if (n >= 3) { t.style.flex = "none"; t.style.height = (n * lh + 8) + "px"; }
   }
 
+  // 聴く画面の文の欄: いま読んでいる部分を文ごとに分けて出し、読んでいる文を欄の先頭に動かす。
+  function renderPtext(ctx, ui, st) {
+    var host = ui.ptext, doc = ctx.doc, all, k, j, lastB = -1, prevKind = "";
+    host.innerHTML = "";
+    host.scrollTop = 0;
+    if (!st.part) return;
+    all = W.YMListen.segsOf(st.entry.card.item, 1, st.i + 1);
+    for (k = 0; k < all.length; k++) if (all[k].part === st.part.part) {
+      for (j = 0; j < all[k].segs.length; j++) {
+        var sg = all[k].segs[j];
+        if (sg.kind === "lead") continue;
+        var gap = (prevKind === "h2" && sg.b === lastB) ? " " : "";
+        var sp = el(doc, "span", "s", (all[k].part === "points" && lastB !== -1 && sg.b !== lastB && sg.show.charAt(0) !== "\n" ? "\n" : "") + gap + sg.show);
+        sp.setAttribute("data-seg", String(j));
+        host.appendChild(sp);
+        lastB = sg.b; prevKind = sg.kind;
+      }
+    }
+    host.appendChild(el(doc, "div", "ppad"));        // 終わりの文も欄の先頭まで寄せられるよう、下に余白を足す
+  }
+  function markPtext(ui, st) {
+    var sg = st.seg;
+    if (!sg || !st.part || sg.part !== st.part.part) return;
+    var key = ui.pkey + "|" + sg.i;
+    if (ui.pcurKey === key) return;
+    ui.pcurKey = key;
+    if (ui.pcur) { ui.pcur.className = "s"; ui.pcur = null; }
+    var target = ui.ptext.querySelector("[data-seg=\"" + sg.i + "\"]");
+    if (!target) return;
+    target.className = "s cur";
+    ui.pcur = target;
+    var er = target.getBoundingClientRect(), pr = ui.ptext.getBoundingClientRect();
+    ui.ptext.scrollTop += er.top - (pr.top + 8);
+  }
+
   function updateListen(ctx, st) {
     var ui = ctx.ui, e = st.entry, it, key, per, i;
     if (!ui || !e) return;
@@ -2882,9 +2920,10 @@
     var pn = { title: "題名", summary: "要旨", conclusion: "結論", points: "主なポイント" };
     var fh = fileHeadingOf(ctx, e.card.filename);
     ui.plab.textContent = (fh ? fh + "・" : "") + (st.part ? ("いま読んでいる部分: " + pn[st.part.part]) : "");
-    var shown = st.part ? st.part.text.replace(/^\d+番。\s*/, "") : "";
-    if (ui.ptext.textContent !== shown) { ui.ptext.textContent = shown; ui.ptext.scrollTop = 0; }
+    var pk = st.part ? fullKey(st) + "|" + st.part.part : "";
+    if (ui.pkey !== pk) { ui.pkey = pk; ui.pcur = null; renderPtext(ctx, ui, st); }
     fitText(ui);
+    markPtext(ui, st);
     ui.play.textContent = st.playing ? "⏸ 停止" : "▶ 再生";
 
     // 深さの列: 各深さの約N分(このカード)、いま効いている深さを青く。
