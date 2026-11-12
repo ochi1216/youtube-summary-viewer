@@ -2,6 +2,7 @@
 <html lang="ja"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover"><title>YouTubeサマリー V2</title></head>
 <body><div id="ym-root"></div>
 <script>var YM_LABELS_CONFIG = {"url": "https://bpdkdwtevqsqgsxlahmd.supabase.co", "anonKey": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImJwZGtkd3RldnFzcWdzeGxhaG1kIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODI1NjAzOTcsImV4cCI6MjA5ODEzNjM5N30.zfxxhgVCmZAGrk2LiSnPpEHg72mjdJne3c6YOXBeCTs"};</script>
+<script>var YM_RSS_ONDEMAND = {models: ["gemini-3.5-flash-lite", "gemini-3.8-flash"], gen: {maxOutputTokens: 4096}};</script>
 <script>/*
  * listen_depth.js - 聴くモードの「読む深さ」の決め打ち。依存なし・独立(統合HTMLに埋め込む / node でテストする)。
  *
@@ -1483,7 +1484,85 @@
     return { session: session, sec: sec, total: ordered.length, rest: ordered.length - session.length };
   }
 
+  // ---- RSSの結論・主なポイントの生成(旧UIの fetchDetailConsolidated と同じ文面・同じ解析) ----
+  // 結論も主なポイントも無いRSSカードか。ポイントだけ有るカードに結論を挟むと、読み上げ中の位置がずれるので対象にしない。
+  function needsDetail(item) {
+    return !!item && item.type === "rss" && !item.is_error && !item.conclusion && !item.points && /^https?:\/\//i.test(String(item.url || ""));
+  }
+  // 結論を読む深さ(＋結論=2 / 全部=1)か。
+  function wantsConclusion(depth) { return depth <= 2; }
+
+  function buildDetailPrompt(url) {
+    return "以下のURLの記事を読み、日本語で次の2項目を出力してください。\n\nURL: " + url + "\n\n出力形式（必ずこの形式で出力）:\n" +
+      "[CONCLUSION]\n結論テキスト（300文字以内）\n[/CONCLUSION]\n[POINTS]\n" +
+      "## 見出し1\n・ポイント内容（100文字程度）\n・ポイント内容（100文字程度）\n" +
+      "## 見出し2\n・ポイント内容（100文字程度）\n・ポイント内容（100文字程度）\n" +
+      "## 見出し3\n・ポイント内容（100文字程度）\n・ポイント内容（100文字程度）\n[/POINTS]\n" +
+      "重要: ## 行は見出し、・行はその配下の箇条書きとする。番号は使わないこと。";
+  }
+
+  function removeTags(s) {
+    var tags = ["[CONCLUSION]", "[/CONCLUSION]", "[POINTS]", "[/POINTS]"], i;
+    s = String(s || "");
+    for (i = 0; i < tags.length; i++) s = s.split(tags[i]).join("");
+    return s.replace(/^\s+|\s+$/g, "");
+  }
+
+  // 応答の文字列 → {ok, reason, conclusion(平文), points:[{h, items:[平文]}]}。
+  // 成功は「結論が空でない かつ 箇条書きが1つ以上」のときだけ。タグが無い応答(拒否文・URLを読めなかった言い訳)は失敗にする。
+  function parseDetail(raw) {
+    var t = String(raw || ""), cs = t.indexOf("[CONCLUSION]"), ce = t.indexOf("[/CONCLUSION]");
+    var ps = t.indexOf("[POINTS]"), pe = t.indexOf("[/POINTS]"), concl = "", pr = "", groups = [], cur = null, lines, i, ln, m;
+    if (cs < 0 || ps < 0) return { ok: false, reason: "応答の形式が合いませんでした", conclusion: "", points: [] };
+    var ca = cs + 12;
+    if (ce > ca) concl = t.substring(ca, ce);
+    else if (ps > ca) concl = t.substring(ca, ps);
+    concl = removeTags(concl);
+    var pa = ps + 8;
+    pr = (pe > pa) ? t.substring(pa, pe) : t.substring(pa);
+    lines = removeTags(pr).split("\n");
+    for (i = 0; i < lines.length; i++) {
+      ln = lines[i].replace(/^\s+|\s+$/g, "");
+      if (!ln) continue;
+      if (ln.substring(0, 2) === "##") {
+        cur = { h: ln.replace(/^#+\s*/, ""), items: [] };
+        groups.push(cur);
+        continue;
+      }
+      m = ln.replace(/^[・•\-]\s*/, "").replace(/^\d+\.\s*/, "").replace(/^\s+|\s+$/g, "");
+      if (!m) continue;
+      if (!cur) { cur = { h: "", items: [] }; groups.push(cur); }
+      cur.items.push(m);
+    }
+    var n = 0;
+    for (i = 0; i < groups.length; i++) n += groups[i].items.length;
+    if (!concl) return { ok: false, reason: "結論が空でした", conclusion: "", points: groups };
+    if (!n) return { ok: false, reason: "主なポイントが空でした", conclusion: concl, points: groups };
+    return { ok: true, reason: "", conclusion: concl, points: groups };
+  }
+
+  function esc(s) {
+    return String(s || "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+  }
+
+  // 解析結果 → item.conclusion / item.points に入れるHTML。本文はすべてエスケープする(「<」を含む文が消えないように)。
+  // 見出しは旧UIと同じ p.fw-bold(青太字)、箇条書きは ul>li。pointBlocks がそのまま読める。
+  function detailToHtml(parsed) {
+    var html = "", i, j, g;
+    for (i = 0; i < parsed.points.length; i++) {
+      g = parsed.points[i];
+      if (g.h) html += "<p class=\"fw-bold\" style=\"color:#2b6cb0;font-weight:700\">" + esc(g.h) + "</p>";
+      if (g.items.length) {
+        html += "<ul class=\"markdown-list\">";
+        for (j = 0; j < g.items.length; j++) html += "<li>" + esc(g.items[j]) + "</li>";
+        html += "</ul>";
+      }
+    }
+    return { conclusion: esc(parsed.conclusion).split("\n").join("<br>"), points: html };
+  }
+
   return {
+    needsDetail: needsDetail, wantsConclusion: wantsConclusion, buildDetailPrompt: buildDetailPrompt, parseDetail: parseDetail, detailToHtml: detailToHtml,
     DEPTHS: DEPTHS, LIMIT_SEC: LIMIT_SEC, CHARS_PER_SEC: CHARS_PER_SEC,
     byDepth: byDepth, byKey: byKey, stripHtml: stripHtml, plainBlocks: plainBlocks, splitSentences: splitSentences, pointBlocks: pointBlocks, segsOf: segsOf, parts: parts, estimateSec: estimateSec,
     minutesLabel: minutesLabel, durLabel: durLabel, perDepth: perDepth, autoDepth: autoDepth, sortCards: sortCards, plan: plan, fileStamp: fileStamp
@@ -2127,6 +2206,7 @@
     ".ym .opt{display:block;width:100%;text-align:left;padding:12px;margin:8px 0;border-radius:10px;border:2px solid #e2e8f0;background:#fff;font-size:1rem}",
     ".ym .opt.on{border-color:#3b6ab0;background:#ebf4ff}.ym .opt small{display:block;color:#718096;margin-top:4px;font-size:.85rem}",
     ".ym .dinp{display:block;width:100%;box-sizing:border-box;font-size:1rem;padding:10px;margin:8px 0;border:1px solid #cbd5e0;border-radius:8px}",
+    ".ym .genrow{margin:10px 0}.ym .gen.err{color:#c53030;border-color:#fc8181;background:#fff5f5}.ym .gen[disabled]{opacity:.7}",
     ".ym .reflinks{display:flex;flex-wrap:wrap;gap:4px 14px;margin:14px 0 4px;font-size:.85rem}.ym .reflinks a{color:#3182ce;text-decoration:none}",
     ".ym .dnote{font-size:.85rem;color:#718096;margin:4px 0}.ym .dlab{font-size:.8rem;color:#3b6ab0;margin-top:6px}",
     ".ym .dtext{font-size:1rem;line-height:1.6;background:#f1f5f9;border-radius:8px;padding:8px;-webkit-user-select:text;user-select:text}",
@@ -2266,8 +2346,10 @@
       ownFiles: (own && typeof own === "object") ? own : {},
       oldChecked: (oldState && oldState.checkedFiles && typeof oldState.checkedFiles === "object") ? oldState.checkedFiles : {},
       player: null, sessionRead: 0, sessionUp: 0, sessionDown: 0, thumbLast: {}, thumbClient: null,
-      dictStore: null, dictClient: null, hist: [], lastSource: "", pinKey: lsGet("ymBetaPin") || null, metaKey: ""
+      dictStore: null, dictClient: null, hist: [], lastSource: "", pinKey: lsGet("ymBetaPin") || null, metaKey: "",
+      genBusy: {}, genErr: {}, bulk: null
     };
+    genRestore(ctx);
     ctx.migrated = ymb.migrateOld(ymb.loadReadV2(), ymb.loadOldHistory(), data.ALL_DATA, Date.now());
     ctx.read = ctx.migrated.read;
     ctx.saved = ymb.saveReadV2(ctx.read);
@@ -2426,6 +2508,226 @@
   }
   function rateOptions() { var rr = [], i; for (i = 0; i < RATES.length; i++) rr.push([RATES[i], RATES[i] + "倍速"]); return rr; }
 
+  // ---- RSSの結論・主なポイントの生成(「ポイント生成」。旧UIの fetchDetailConsolidated と同じ文面・同じAPI) ----
+  var GEN_STORE = "ymBetaGen", GEN_MAX = 30, GEN_API_KEY = "gemini_api_key", GEN_TIMEOUT_MS = 90000;
+
+  // 殻に埋め込まれた設定(モデル候補・出力上限)。無ければ生成しない(ボタンも出さない)。
+  function genConfig() { var c = W.YM_RSS_ONDEMAND; return (c && c.models && c.models.length && c.gen) ? c : null; }
+  function genKey() { return String(lsGet(GEN_API_KEY) || "").replace(/^\s+|\s+$/g, ""); }
+  function genStateEl(ctx) { return ctx.root && ctx.root.className.indexOf("listening") >= 0; }
+
+  // 保存(再読込しても作り直さないため)。このアプリのキー ymBetaGen だけを読み書きする。古い順に30件まで。容量超過は古い分から捨てて再試行する。
+  function genLoad() { var o = readJson(GEN_STORE); return (o && typeof o === "object" && !(o instanceof Array)) ? o : {}; }
+  function genSave(map) {
+    var keys = [], k;
+    for (k in map) if (Object.prototype.hasOwnProperty.call(map, k)) keys.push(k);
+    keys.sort(function (a, b) { return ((map[a] && map[a].t) || 0) - ((map[b] && map[b].t) || 0); });
+    while (keys.length > GEN_MAX) delete map[keys.shift()];
+    for (;;) {
+      if (lsSet(GEN_STORE, JSON.stringify(map))) return true;
+      if (!keys.length) return false;
+      delete map[keys.shift()];
+    }
+  }
+
+  // 同じ記事(同じキー)のRSSカードすべてへ反映する。他の種類(YouTube等)の同じキーは触らない。force: V2で作った分を作り直す。
+  function genApply(ctx, key, html, force) {
+    var arr = ctx.byKey[key] || [], i, it, n = 0;
+    for (i = 0; i < arr.length; i++) {
+      it = arr[i].item;
+      if (W.YMListen.needsDetail(it) || (force && it._gen && it.type === "rss")) { it.conclusion = html.conclusion; it.points = html.points; it._gen = true; n++; }
+    }
+    return n;
+  }
+
+  function genRestore(ctx) {
+    var map = genLoad(), k, v, html;
+    for (k in map) if (Object.prototype.hasOwnProperty.call(map, k)) {
+      v = map[k];
+      if (!v || typeof v.c !== "string" || !v.c || !(v.g instanceof Array)) continue;
+      html = W.YMListen.detailToHtml({ conclusion: v.c, points: v.g });
+      if (html.points) genApply(ctx, k, html, false);
+    }
+  }
+
+  function genTextOf(data) {
+    var ps = (data && data.candidates && data.candidates[0] && data.candidates[0].content && data.candidates[0].content.parts) || [], out = [], i;
+    for (i = 0; i < ps.length; i++) out.push(ps[i] && ps[i].text ? ps[i].text : "");
+    return out.join("\n");
+  }
+
+  // Gemini を呼ぶ。次のモデルへ進む条件は旧UIと同じ(404・429・503・通信エラー・時間切れ)に、空の応答を足した。判定は状態コードの数値で行う。
+  // cb(err, text)。err: {message, keyError}。
+  function genCall(cfg, apiKey, url, timeoutMs, cb) {
+    var idx = 0, lastErr = null;
+    function clean(msg) { msg = String(msg || ""); return apiKey ? msg.split(apiKey).join("***") : msg; }
+    function next() {
+      if (idx >= cfg.models.length) { cb(lastErr || { message: "応答が空でした" }); return; }
+      var model = cfg.models[idx++], done = false, timer = null;
+      var ctl = (typeof W.AbortController === "function") ? new W.AbortController() : null;
+      var body = { contents: [{ parts: [{ text: W.YMListen.buildDetailPrompt(url) }] }], tools: [{ url_context: {} }], generationConfig: cfg.gen };
+      function finish(err, text) {
+        if (done) return;
+        done = true;
+        if (timer) clearTimeout(timer);
+        if (!err) {
+          if (text && String(text).replace(/\s/g, "")) { cb(null, text); return; }
+          lastErr = { message: "応答が空でした" }; next(); return;
+        }
+        lastErr = err;
+        if (err.retry) next(); else cb(err);
+      }
+      timer = setTimeout(function () {
+        if (ctl) { try { ctl.abort(); } catch (e0) { } }
+        finish({ message: "時間切れ(" + Math.round(timeoutMs / 1000) + "秒)", retry: true });
+      }, timeoutMs);
+      var opt = { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) };
+      if (ctl) opt.signal = ctl.signal;
+      var p;
+      try { p = W.fetch("https://generativelanguage.googleapis.com/v1beta/models/" + model + ":generateContent?key=" + encodeURIComponent(apiKey), opt); }
+      catch (e1) { finish({ message: "通信エラー", retry: true }); return; }
+      p.then(function (resp) {
+        if (resp.ok) return resp.json().then(function (data) { finish(null, genTextOf(data)); }, function () { finish({ message: "応答を読めませんでした", retry: true }); });
+        return resp.json().then(function (e) { return e; }, function () { return {}; }).then(function (ed) {
+          var msg = clean((ed && ed.error && ed.error.message) || resp.statusText || ""), st = resp.status;
+          finish({ message: "APIエラー(" + st + ")" + (msg ? ": " + msg : ""), retry: (st === 404 || st === 429 || st === 503),
+                   keyError: (st === 401 || st === 403 || (st === 400 && /api key/i.test(msg))) });
+        });
+      }).then(null, function () { finish({ message: "通信エラー", retry: true }); });
+    }
+    next();
+  }
+
+  // 画面を更新する。全文シートを開いていてそのカードなら作り直す(スクロール位置は保つ)。聴く画面なら描き直す。聴く画面を離れた後は何もしない。
+  function genRefresh(ctx, key) {
+    try {
+      if (!ctx.player) return;
+      var st = ctx.player.state(), sh = ctx.sheet, y;
+      if (!st.entry) return;
+      if (sh && sh.getAttribute("data-mode") === "full" && sh.className.indexOf("show") >= 0 && st.entry.card.key === key) {
+        y = sh.scrollTop;
+        buildFull(ctx, st); sh.className = "sheet show";
+        updateFullHighlight(ctx, st);
+        sh.scrollTop = y;
+      }
+      if (ctx.ui && genStateEl(ctx)) updateListen(ctx, st);
+    } catch (e) { }
+  }
+
+  // 1枚を生成する。cb(ok, err)。fresh: 入力されたばかりのキー(成功したときだけ保存する)。
+  function genOne(ctx, card, force, apiKey, fresh, cb) {
+    var cfg = genConfig(), key = card.key;
+    if (!cfg || ctx.genBusy[key]) { if (cb) cb(false, { message: "生成中です" }); return; }
+    ctx.genBusy[key] = true; delete ctx.genErr[key];
+    genRefresh(ctx, key);
+    genCall(cfg, apiKey, card.item.url, ctx.genTimeout || GEN_TIMEOUT_MS, function (err, text) {
+      ctx.genBusy[key] = false;
+      var parsed, html, map;
+      if (!err) {
+        parsed = W.YMListen.parseDetail(text);
+        if (!parsed.ok) err = { message: parsed.reason };
+      }
+      if (err) {
+        ctx.genErr[key] = "失敗: " + String(err.message || "不明なエラー");
+        if (err.keyError) {
+          ctx.genErr[key] = "APIキーが正しくありません。入力し直してください";
+          if (!fresh) { try { W.localStorage.removeItem(GEN_API_KEY); } catch (e2) { } }
+        }
+        genRefresh(ctx, key);
+        if (cb) cb(false, err);
+        return;
+      }
+      html = W.YMListen.detailToHtml(parsed);
+      if (fresh) lsSet(GEN_API_KEY, apiKey);
+      genApply(ctx, key, html, force);
+      map = genLoad();
+      map[key] = { c: parsed.conclusion, g: parsed.points, t: Date.now() };
+      genSave(map);
+      genRefresh(ctx, key);
+      if (cb) cb(true, null);
+    });
+  }
+
+  // APIキーの入力シート。入力しただけでは保存しない(生成に成功したときだけ保存)。onKey(キー)
+  function openKeySheet(ctx, onKey, onCancel) {
+    var doc = ctx.doc, sh = openSheet(ctx, "apikey", "Gemini APIキー");
+    sh.appendChild(el(doc, "div", "dnote", "ポイント生成に使います。成功するとこの端末のブラウザ(旧UIと共通)に保存します。"));
+    var inp = el(doc, "input", "dinp"); inp.type = "password"; inp.id = "ymApiKeyInput"; inp.placeholder = "AIza...";
+    inp.setAttribute("autocomplete", "off"); inp.setAttribute("autocapitalize", "off"); inp.setAttribute("autocorrect", "off");
+    var go = el(doc, "button", "btn", "生成する"); go.id = "ymApiKeyGo";
+    go.addEventListener("click", function () {
+      var v = String(inp.value || "").replace(/^\s+|\s+$/g, "");
+      if (!v) { toast(ctx, "APIキーを入力してください", true); return; }
+      closeSheet(ctx);
+      onKey(v);
+    });
+    sh.appendChild(inp); sh.appendChild(go);
+    if (onCancel) sh.querySelector(".close").addEventListener("click", onCancel);
+  }
+
+  // キーを用意して fn(キー, 入力したてか) を呼ぶ。
+  function genWithKey(ctx, fn, onCancel) {
+    var k = genKey();
+    if (k) { fn(k, false); return; }
+    openKeySheet(ctx, function (v) { fn(v, true); }, onCancel);
+  }
+
+  function genStart(ctx, card, force) {
+    if (!genConfig() || ctx.genBusy[card.key]) return;
+    var from = (ctx.sheet && ctx.sheet.getAttribute("data-mode") === "full" && ctx.sheet.className.indexOf("show") >= 0) ? "full" : "";
+    genWithKey(ctx, function (apiKey, fresh) {
+      genOne(ctx, card, force, apiKey, fresh, null);
+      if (fresh && from === "full" && ctx.player && ctx.player.state().entry) openFull(ctx);     // キー入力でシートが閉じたので、全文を開き直す
+    });
+  }
+
+  // 「ポイント生成」「作り直す」ボタン。状態は ctx.genBusy / ctx.genErr から描く(画面を描き直しても失われない)。出さないときは null。
+  function genButton(ctx, card, doc) {
+    var it = card.item, redo = !!(it && it._gen && it.type === "rss"), b;
+    if (!genConfig()) return null;
+    if (!redo && !W.YMListen.needsDetail(it) && !ctx.genBusy[card.key] && !ctx.genErr[card.key]) return null;
+    b = el(doc, "button", "btn gen", redo ? "作り直す" : "ポイント生成");
+    b.setAttribute("data-gen", redo ? "redo" : "make");
+    if (ctx.genBusy[card.key]) { b.textContent = "⏳ 生成中…"; b.disabled = true; }
+    else if (ctx.genErr[card.key]) { b.className = "btn gen err"; b.textContent = "⚠ " + ctx.genErr[card.key] + "(もう一度押す)"; }
+    b.addEventListener("click", function () { genStart(ctx, card, redo); });
+    return b;
+  }
+
+  // ホーム: 今回の聴く分のうち、結論まで読む深さなのに結論が無いRSSをまとめて作る(ロック画面では押せないので、聴く前に作る)。順番に1件ずつ。タップで中止。
+  function bulkNeeds(plan) {
+    var out = [], seen = {}, i, s;
+    for (i = 0; i < plan.session.length; i++) {
+      s = plan.session[i];
+      if (W.YMListen.wantsConclusion(s.depth) && W.YMListen.needsDetail(s.card.item) && !seen[s.card.key]) { seen[s.card.key] = true; out.push(s.card); }
+    }
+    return out;
+  }
+  function bulkGenerate(ctx, cards, btn) {
+    if (ctx.bulk) { ctx.bulk.stop = true; btn.textContent = "中止しています…"; return; }
+    var bk = { stop: false }, i = 0, ok = 0, fail = 0;
+    ctx.bulk = bk;
+    genWithKey(ctx, function (apiKey, fresh) {
+      function step() {
+        var b = ctx.doc.getElementById("ymBulkGen");
+        if (bk.stop || i >= cards.length) {
+          ctx.bulk = null;
+          if (ctx.root && ctx.root.className === "ym") renderHome(ctx);
+          toast(ctx, "ポイント生成: " + ok + "件完了" + (fail ? "・失敗" + fail + "件" : "") + (bk.stop ? "(中止)" : ""), fail > 0);
+          return;
+        }
+        if (b) b.textContent = "⏳ " + (i + 1) + " / " + cards.length + "件 生成中…(タップで中止)";
+        genOne(ctx, cards[i], false, apiKey, fresh, function (okFlag, err) {
+          fresh = false;
+          if (okFlag) ok++; else { fail++; if (err && err.keyError) bk.stop = true; }
+          i++;
+          step();
+        });
+      }
+      step();
+    }, function () { if (ctx.bulk === bk) ctx.bulk = null; });      // キー入力を取りやめたら、まとめ生成の状態を戻す
+  }
+
   // ---- ホーム ----
   function fileStats(ctx) {
     var map = {}, i;
@@ -2545,6 +2847,12 @@
       "流し読み: 未読 " + plan.total + "件を " + skimSecsPref() + "秒ずつ → 約" + skimMinLabel(plan.total * skimSecsPref()) + "(音声なし)";
     if (!ctx.saved) info += "\n※既読を保存できませんでした(ブラウザの保存制限)";
     root.appendChild(el(doc, "pre", "", info));
+    var needs = genConfig() ? bulkNeeds(plan) : [];        // 結論まで読む深さなのに結論が無いRSS(今回の聴く分)
+    if (needs.length || ctx.bulk) {
+      var gbk = el(doc, "button", "btn", ctx.bulk ? "⏳ 生成中…(タップで中止)" : "ポイント生成(RSS " + needs.length + "件・結論なし)"); gbk.id = "ymBulkGen";
+      gbk.addEventListener("click", function () { bulkGenerate(ctx, needs, gbk); });
+      root.appendChild(gbk);
+    }
 
     var row = el(doc, "div", "row");
     var ob = el(doc, "button", "btn", "読む順: " + ORDERS[ctx.order === "score" ? 0 : (ctx.order === "newest" ? 1 : 2)][1] + " ▾");
@@ -2718,6 +3026,8 @@
       }
       sh.appendChild(d);
     }
+    var gb = genButton(ctx, st.entry.card, doc);       // 結論・主なポイントが無いRSS: 要旨の下に「ポイント生成」
+    if (gb) { var gr = el(doc, "div", "genrow"); gr.appendChild(gb); sh.appendChild(gr); }
     var foot = el(doc, "div", "foot");
     var keep = el(doc, "button", "", "閉じて聴き続ける");
     keep.addEventListener("click", function () { closeSheet(ctx); if (ctx.player && !ctx.player.state().playing) ctx.player.play(); });
@@ -2834,6 +3144,7 @@
     ui.dline.addEventListener("touchmove", function () { if (pressT) { clearTimeout(pressT); pressT = null; } }, { passive: true });
     root.appendChild(ui.dline);
     ui.why = el(doc, "div", "why"); root.appendChild(ui.why);
+    ui.genrow = el(doc, "div", "genrow"); ui.genrow.style.display = "none"; root.appendChild(ui.genrow);     // 「ポイント生成」(結論の無いRSSのときだけ)
 
     var home = el(doc, "div", "links");
     var hb = el(doc, "button", "", "ホームへ戻る");
@@ -2960,6 +3271,18 @@
     ui.pin.className = "pin" + (st.pinKey ? " on" : "");
     ui.why.textContent = st.depthKey ? ("このカードだけ「" + st.depthName + "」") :
       (st.pinKey ? ("📌 ずっと「" + st.depthName + "」") : ("🎧自動: " + e.why + " → " + e.name));
+    // RSSで結論がまだ無いカード: 結論まで読む深さなら注意を出し、「ポイント生成」を出す。
+    var effD = W.YMListen.byKey(eff), noDetail = W.YMListen.needsDetail(it);
+    if (noDetail && effD && W.YMListen.wantsConclusion(effD.depth)) ui.why.textContent += "\n※このRSSはまだ結論がありません(下の「ポイント生成」で作れます)";
+    if (noDetail) { for (key in ui.chips) if (key === "conclusion" || key === "all") ui.chips[key].lastChild.textContent += "※"; }
+    var gbtn = genButton(ctx, e.card, ctx.doc);
+    if (gbtn && gbtn.getAttribute("data-gen") === "redo") gbtn = null;      // 作り直すは全文シートだけ
+    var gsig = gbtn ? (e.card.key + "|" + gbtn.textContent + "|" + gbtn.disabled + "|" + gbtn.className) : "";
+    if (ui.gensig !== gsig) {                       // 内容が変わったときだけ差し替える(読み上げの更新ごとに作り直さない)
+      ui.gensig = gsig;
+      ui.genrow.innerHTML = "";
+      if (gbtn) { ui.genrow.appendChild(gbtn); ui.genrow.style.display = ""; } else ui.genrow.style.display = "none";
+    }
 
     if (safeUrl(it.url)) { ui.src.href = safeUrl(it.url); ui.src.style.display = ""; } else ui.src.style.display = "none";
     var k = W.YtLabels ? W.YtLabels.cardKey(it) : "";
