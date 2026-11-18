@@ -2318,13 +2318,16 @@
     try { W.navigator.mediaSession.metadata = new W.MediaMetadata({ title: title, artist: artist, album: album }); } catch (e) { }
   }
 
-  function pickVoice(ut) {
-    ut.lang = "ja-JP";
+  // 声の選び方。声の一覧はブラウザが後から読み込む(iOS Safari・Chrome は、最初の getVoices() が空の配列を返す)。
+  // 空のまま最初の文を話すと、声を指定できず端末の標準の声(低い音質)で読まれる。そのため起動時(warmVoices)に読み込みを始め、
+  // 読み込めたら(voiceschanged)良い声を選んでおく。旧UIも起動時に getVoices() を呼んでいる。
+  var voiceBest = null;
+  function chooseVoice() {
     var vs = [];
     try { vs = W.speechSynthesis.getVoices() || []; } catch (e) { }
     var ja = [], i;
     for (i = 0; i < vs.length; i++) if (vs[i].lang && vs[i].lang.indexOf("ja") >= 0) ja.push(vs[i]);
-    if (!ja.length) return;
+    if (!ja.length) return null;
     function find(f) { for (var k = 0; k < ja.length; k++) if (f(ja[k])) return ja[k]; return null; }
     var best = find(function (v) { return /siri/i.test(v.name) && v.name.indexOf("2") >= 0; }) ||
       find(function (v) { return /siri/i.test(v.name); }) ||
@@ -2332,7 +2335,22 @@
       find(function (v) { return v.name.indexOf("Natural") >= 0; }) ||
       find(function (v) { return v.name.indexOf("Haruka") >= 0; }) ||
       find(function (v) { return v.name.indexOf("Microsoft") >= 0; });
-    ut.voice = best || ja[ja.length - 1];
+    voiceBest = best || ja[ja.length - 1];
+    return voiceBest;
+  }
+  function warmVoices() {
+    try {
+      if (!W.speechSynthesis) return;
+      chooseVoice();
+      var again = function () { chooseVoice(); };
+      if (W.speechSynthesis.addEventListener) W.speechSynthesis.addEventListener("voiceschanged", again);
+      else W.speechSynthesis.onvoiceschanged = again;
+    } catch (e) { }
+  }
+  function pickVoice(ut) {
+    ut.lang = "ja-JP";
+    var v = chooseVoice() || voiceBest;          // 毎回選び直す(後から良い声が読み込まれることがある)。読めなければ前に選んだ声
+    if (v) ut.voice = v;
   }
 
   // ---- 状態 ----
@@ -3899,6 +3917,7 @@
     root.className = "ym";
     function say(t) { root.innerHTML = ""; root.appendChild(el(doc, "pre", "", t)); }
     say("index.html を読み込み中…");
+    warmVoices();       // 声の一覧の読み込みを、聴き始める前に始めておく(最初の文が標準の声になるのを防ぐ)
     // 画面に戻ってきたとき、読み上げ中なら画面スリープ抑止を取り直す(タブが隠れると自動で解放されるため)。
     doc.addEventListener("visibilitychange", function () {
       if (doc.visibilityState === "visible" && W.ymCtx && W.ymCtx.player && W.ymCtx.player.state().playing) bgStart();
