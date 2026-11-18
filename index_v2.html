@@ -1591,6 +1591,7 @@
   "use strict";
 
   var GAP_MS = 10;
+  var HOLD_MS = 500;      // カードの終わりで待つときの確かめ間隔
 
   /*
    * o:
@@ -1605,6 +1606,8 @@
    *   onChange(state)  状態が変わるたび
    *   onCardEnd(entry, how)
    *   onFinish()  最後のカードまで終えたとき
+   *   hold(entry) true の間は、カードを読み終えても次へ進まずに待つ(省略可。RSSの「ポイント生成」の完了待ち)。
+   *               待っている間に読む部分が増えれば、その続きから読む。false になれば次のカードへ。
    *   setTimer / clearTimer  テスト用の差し替え
    */
   function create(o) {
@@ -1647,7 +1650,7 @@
       var e = entry(), sg = e ? segsFor(e)[st.p] : null;
       return {
         i: st.i, p: st.p, s: st.s, seg: (sg && st.s < sg.segs.length) ? { part: sg.part, i: st.s } : null, total: items.length, playing: st.playing, finished: st.finished,
-        rate: st.rate, depthKey: st.depthKey, pinKey: st.pinKey, remainingSec: remainingSec(), entry: e,
+        rate: st.rate, depthKey: st.depthKey, pinKey: st.pinKey, remainingSec: remainingSec(), entry: e, waiting: !!st.waiting,
         depthName: e ? depthOf(e).name : "", auto: !st.depthKey,
         part: e ? (partsFor(e)[st.p] || null) : null
       };
@@ -1673,7 +1676,7 @@
     function leaveCard(how) {
       var e = entry();
       if (e && o.onCardEnd) { try { o.onCardEnd(e, how); } catch (err) { } }
-      st.i++; st.p = 0; st.s = 0; st.depthKey = null;
+      st.i++; st.p = 0; st.s = 0; st.depthKey = null; st.waiting = false;
       if (st.i >= items.length) { st.i = items.length; finishAll(); return false; }
       return true;
     }
@@ -1684,9 +1687,19 @@
       if (!e) { finishAll(); return; }
       var ps = partsFor(e);
       if (st.p >= ps.length) {
+        var wait = false;
+        try { wait = !!(o.hold && o.hold(e)); } catch (errH) { wait = false; }
+        if (wait) {                                  // 生成の完了を待つ(読み終えた扱いにしない)
+          if (!st.waiting) { st.waiting = true; emit(); }
+          if (timer) clearT(timer);
+          timer = setT(function () { timer = null; speak(); }, HOLD_MS);
+          return;
+        }
+        st.waiting = false;
         if (leaveCard("end")) { emit(); schedule(); }
         return;
       }
+      if (st.waiting) { st.waiting = false; emit(); }
       // 部分の文を使い切った(または文が1つも無い部分)ときは、次の部分へ。
       var sgs = segsFor(e)[st.p], segs = sgs ? sgs.segs : [];
       if (st.s >= segs.length) { st.p++; st.s = 0; emit(); schedule(); return; }
@@ -2676,6 +2689,11 @@
     if (!genConfig() || ctx.genBusy[card.key]) return;
     var from = (ctx.sheet && ctx.sheet.getAttribute("data-mode") === "full" && ctx.sheet.className.indexOf("show") >= 0) ? "full" : "";
     genWithKey(ctx, function (apiKey, fresh) {
+      // 聴いているカードで押したら、このカードだけ「全部」で読む(結論・主なポイントまで読まない深さだと、待っても何も読まれないため)
+      if (ctx.player) {
+        var st = ctx.player.state(), e = st.entry, d = e ? W.YMListen.byKey(st.depthKey || st.pinKey || e.key) : null;
+        if (e && e.card.key === card.key && (!d || d.key !== "all")) ctx.player.setDepth("all");
+      }
       genOne(ctx, card, force, apiKey, fresh, null);
       if (fresh && from === "full" && ctx.player && ctx.player.state().entry) openFull(ctx);     // キー入力でシートが閉じたので、全文を開き直す
     });
@@ -3249,7 +3267,8 @@
     ui.title.textContent = W.YMListen.stripHtml(it.title);
     var pn = { title: "題名", summary: "要旨", conclusion: "結論", points: "主なポイント" };
     var fh = fileHeadingOf(ctx, e.card.filename);
-    ui.plab.textContent = (fh ? fh + "・" : "") + (st.part ? ("いま読んでいる部分: " + pn[st.part.part]) : "");
+    ui.plab.textContent = (fh ? fh + "・" : "") + (st.waiting ? "⏳ ポイント生成を待っています(できたら続けて読みます)" :
+      (st.part ? ("いま読んでいる部分: " + pn[st.part.part]) : ""));
     var pk = st.part ? fullKey(st) + "|" + st.part.part : "";
     if (ui.pkey !== pk) { ui.pkey = pk; ui.pcur = null; renderPtext(ctx, ui, st); }
     fitText(ui);
@@ -3863,6 +3882,7 @@
       bg: { start: bgStart, stopSoon: function () { bgStopSoon(function () { return ctx.player && ctx.player.state().playing; }); } },
       onChange: function (st) { updateListen(ctx, st); },
       onCardEnd: function (e) { markRead(ctx, e.card); },
+      hold: function (e) { return !!ctx.genBusy[e.card.key]; },          // ポイント生成中は、読み終えても次のカードへ進まずに待つ
       onFinish: function () { announceEnd(ctx); renderEnd(ctx); },
       onError: function (why) { toast(ctx, "読み上げできませんでした(" + why + ")。▶ で再開できます", true); }
     });
